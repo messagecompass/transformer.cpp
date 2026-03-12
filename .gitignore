@@ -1,0 +1,12 @@
+# Compiled binaries
+transformer_test
+transformer_train
+
+# Generated data files
+weights.bin
+ref_logits.txt
+py_losses.txt
+cpp_losses.txt
+
+# macOS
+.DS_Store
