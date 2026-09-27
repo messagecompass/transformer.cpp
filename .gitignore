@@ -10,3 +10,7 @@ cpp_losses.txt
 
 # macOS
 .DS_Store
+train_and_run
+input.txt
+tinystories_model.bin
+train
