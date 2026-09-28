@@ -13,17 +13,34 @@
 #include <map>
 #include <fstream>
 
-// Dynamic vocabulary and corpus configuration
-const int MAX_VOCAB = 20000;
+// ============================================================================
+// HYPERPARAMETERS & CONFIGURATION (Modify these easily to experiment!)
+// ============================================================================
+
+// Model Architecture
+const int   MAX_VOCAB      = 12000;
+const int   Context_LEN    = 100;      
+const int   N_LAYERS       = 4;
+const int   D_MODEL        = 64;      
+const int   N_HEADS        = 4;
+const int   D_HEAD         = D_MODEL / N_HEADS;   
+const int   D_MLP          = D_MODEL * 4;          
+
+// Training Settings
+const int   N_STEPS        = 40000;
+const int   WARMUP_STEPS   = 1000;
+const float MAX_LR         = 0.003f;
+const float MIN_LR         = 0.0001f;
+
+// Generation & File Settings
+const int   MAX_NEW_TOKENS = 100;
+const char* TRAINING_FILE  = "TinyStories-valid.txt";
+const char* MODEL_FILE     = "tinystories_model.bin";
+
+// ============================================================================
+
 int VOCAB = 0;
 char VOCAB_WORDS[MAX_VOCAB][32];
-
-const int SEQ_LEN  = 24;      
-const int N_LAYERS = 6;
-const int D_MODEL  = 256;      
-const int N_HEADS  = 4;
-const int D_HEAD   = D_MODEL / N_HEADS;   
-const int D_MLP    = D_MODEL * 4;          
 
 float token_embedding[MAX_VOCAB][D_MODEL];
 float W_Q[N_LAYERS][N_HEADS][D_HEAD][D_MODEL];
@@ -55,31 +72,31 @@ float g_ln_final_scale[D_MODEL];
 float g_ln_final_bias  [D_MODEL];
 float g_W_unembed[MAX_VOCAB][D_MODEL];
 
-float s_xhat_attn[N_LAYERS][SEQ_LEN][D_MODEL];
-float s_inv_std_attn[N_LAYERS][SEQ_LEN];
-float s_normed_attn[N_LAYERS][SEQ_LEN][D_MODEL];
-float s_q[N_LAYERS][N_HEADS][SEQ_LEN][D_HEAD];
-float s_k[N_LAYERS][N_HEADS][SEQ_LEN][D_HEAD];
-float s_v[N_LAYERS][N_HEADS][SEQ_LEN][D_HEAD];
-float s_attn_w[N_LAYERS][N_HEADS][SEQ_LEN][SEQ_LEN];
-float s_attn_out[N_LAYERS][SEQ_LEN][D_MODEL];
-float s_xhat_mlp[N_LAYERS][SEQ_LEN][D_MODEL];
-float s_inv_std_mlp[N_LAYERS][SEQ_LEN];
-float s_normed_mlp[N_LAYERS][SEQ_LEN][D_MODEL];
-float s_mlp_pre_relu[N_LAYERS][SEQ_LEN][D_MLP];
-float s_xhat_final[SEQ_LEN][D_MODEL];
-float s_inv_std_final[SEQ_LEN];
-float s_normed_final[SEQ_LEN][D_MODEL];
+float s_xhat_attn[N_LAYERS][Context_LEN][D_MODEL];
+float s_inv_std_attn[N_LAYERS][Context_LEN];
+float s_normed_attn[N_LAYERS][Context_LEN][D_MODEL];
+float s_q[N_LAYERS][N_HEADS][Context_LEN][D_HEAD];
+float s_k[N_LAYERS][N_HEADS][Context_LEN][D_HEAD];
+float s_v[N_LAYERS][N_HEADS][Context_LEN][D_HEAD];
+float s_attn_w[N_LAYERS][N_HEADS][Context_LEN][Context_LEN];
+float s_attn_out[N_LAYERS][Context_LEN][D_MODEL];
+float s_xhat_mlp[N_LAYERS][Context_LEN][D_MODEL];
+float s_inv_std_mlp[N_LAYERS][Context_LEN];
+float s_normed_mlp[N_LAYERS][Context_LEN][D_MODEL];
+float s_mlp_pre_relu[N_LAYERS][Context_LEN][D_MLP];
+float s_xhat_final[Context_LEN][D_MODEL];
+float s_inv_std_final[Context_LEN];
+float s_normed_final[Context_LEN][D_MODEL];
 
-float residual[SEQ_LEN][D_MODEL];
-float logits  [SEQ_LEN][MAX_VOCAB];
-float d_residual[SEQ_LEN][D_MODEL];
-float d_logits  [SEQ_LEN][MAX_VOCAB];
-float d_attn_out_buf[SEQ_LEN][D_MODEL];
-float d_normed_buf  [SEQ_LEN][D_MODEL];
-float d_q[N_HEADS][SEQ_LEN][D_HEAD];
-float d_k[N_HEADS][SEQ_LEN][D_HEAD];
-float d_v[N_HEADS][SEQ_LEN][D_HEAD];
+float residual[Context_LEN][D_MODEL];
+float logits  [Context_LEN][MAX_VOCAB];
+float d_residual[Context_LEN][D_MODEL];
+float d_logits  [Context_LEN][MAX_VOCAB];
+float d_attn_out_buf[Context_LEN][D_MODEL];
+float d_normed_buf  [Context_LEN][D_MODEL];
+float d_q[N_HEADS][Context_LEN][D_HEAD];
+float d_k[N_HEADS][Context_LEN][D_HEAD];
+float d_v[N_HEADS][Context_LEN][D_HEAD];
 
 std::mt19937 rng(42);
 
@@ -89,14 +106,11 @@ inline float relu_grad(float x) { return x > 0.0f ? 1.0f : 0.0f; }
 
 // Learning rate schedule with warmup and cosine decay
 float get_lr(int step, int total_steps) {
-    int warmup_steps = 1000;
-    float max_lr = 0.003f;
-    float min_lr = 0.0001f;
-    if (step < warmup_steps) {
-        return max_lr * ((float)step / warmup_steps);
+    if (step < WARMUP_STEPS) {
+        return MAX_LR * ((float)step / WARMUP_STEPS);
     }
-    float progress = (float)(step - warmup_steps) / (total_steps - warmup_steps);
-    return min_lr + 0.5f * (max_lr - min_lr) * (1.0f + cosf(progress * 3.14159265f));
+    float progress = (float)(step - WARMUP_STEPS) / (total_steps - WARMUP_STEPS);
+    return MIN_LR + 0.5f * (MAX_LR - MIN_LR) * (1.0f + cosf(progress * 3.14159265f));
 }
 
 void initialize_weights()
@@ -330,7 +344,6 @@ float forward_pass(int* tokens, int* targets, int seq_len)
     return loss / seq_len;
 }
 
-
 void backward_pass(int* tokens, int* targets, int seq_len)
 {
     float scale = 1.0f / sqrtf((float)D_HEAD);
@@ -351,7 +364,7 @@ void backward_pass(int* tokens, int* targets, int seq_len)
         }
     }
 
-    float d_normed_final[SEQ_LEN][D_MODEL];
+    float d_normed_final[Context_LEN][D_MODEL];
     memset(d_normed_final, 0, sizeof(d_normed_final));
     for (int pos = 0; pos < seq_len; pos++)
         for (int v = 0; v < VOCAB; v++) {
@@ -426,7 +439,7 @@ void backward_pass(int* tokens, int* targets, int seq_len)
         for (int h = 0; h < N_HEADS; h++) {
             int offset = h * D_HEAD;
             for (int i = 0; i < seq_len; i++) {
-                float d_attn_w[SEQ_LEN];
+                float d_attn_w[Context_LEN];
                 memset(d_attn_w, 0, sizeof(d_attn_w));
                 for (int j = 0; j <= i; j++)
                     for (int dh = 0; dh < D_HEAD; dh++) {
@@ -436,7 +449,7 @@ void backward_pass(int* tokens, int* targets, int seq_len)
 
                 float dot = 0.0f;
                 for (int j = 0; j < seq_len; j++) dot += d_attn_w[j] * s_attn_w[layer][h][i][j];
-                float d_score[SEQ_LEN];
+                float d_score[Context_LEN];
                 for (int j = 0; j < seq_len; j++) d_score[j] = s_attn_w[layer][h][i][j] * (d_attn_w[j] - dot);
 
                 for (int j = 0; j <= i; j++)
@@ -528,7 +541,6 @@ void save_model(const std::string& filename)
         return;
     }
 
-    // Write all core weight matrices sequentially
     file.write((char*)token_embedding, sizeof(token_embedding));
     file.write((char*)W_Q, sizeof(W_Q));
     file.write((char*)W_K, sizeof(W_K));
@@ -577,10 +589,10 @@ void load_model(const std::string& filename)
 
 void generate_words(const int* prompt_ids, int prompt_len, int max_new_tokens)
 {
-    int current_tokens[SEQ_LEN];
-    for (int i = 0; i < SEQ_LEN; i++) current_tokens[i] = 0;
+    int current_tokens[Context_LEN];
+    for (int i = 0; i < Context_LEN; i++) current_tokens[i] = 0;
 
-    for (int i = 0; i < prompt_len && i < SEQ_LEN; i++) {
+    for (int i = 0; i < prompt_len && i < Context_LEN; i++) {
         current_tokens[i] = prompt_ids[i];
     }
 
@@ -594,14 +606,14 @@ void generate_words(const int* prompt_ids, int prompt_len, int max_new_tokens)
     }
 
     for (int t = 0; t < max_new_tokens; t++) {
-        forward_pass(current_tokens, current_tokens, SEQ_LEN);
+        forward_pass(current_tokens, current_tokens, Context_LEN);
 
         int last_pos = 0;
-        for (int i = 0; i < SEQ_LEN; i++) {
+        for (int i = 0; i < Context_LEN; i++) {
             if (current_tokens[i] != 0) last_pos = i;
         }
 
-        for (int i = 0; i < SEQ_LEN; i++) {
+        for (int i = 0; i < Context_LEN; i++) {
             int recent_word = current_tokens[i];
             if (recent_word > 0 && recent_word < VOCAB) {
                 logits[last_pos][recent_word] *= 0.05f;
@@ -619,10 +631,10 @@ void generate_words(const int* prompt_ids, int prompt_len, int max_new_tokens)
 
         printf("%s ", VOCAB_WORDS[best_token]);
 
-        for (int i = 0; i < SEQ_LEN - 1; i++) {
+        for (int i = 0; i < Context_LEN - 1; i++) {
             current_tokens[i] = current_tokens[i + 1];
         }
-        current_tokens[SEQ_LEN - 1] = best_token;
+        current_tokens[Context_LEN - 1] = best_token;
         if (std::string(VOCAB_WORDS[best_token]) == "<|endoftext|>") {
             printf("\n[Reached end of text]\n");
             break;
@@ -645,10 +657,9 @@ bool load_and_tokenize_corpus(const std::string& filename, std::vector<int>& tra
         printf("Successfully loaded training corpus from '%s'.\n", filename.c_str());
     } else {
         printf("'%s' not found. Falling back to default story corpus.\n", filename.c_str());
-        corpus = "I walk down a wide road... <|endoftext|> Once upon a time..."; // fallback with special token
+        corpus = "I walk down a wide road... <|endoftext|> Once upon a time...";
     }
 
-    // Step 1: Parse and count frequencies of raw words
     std::stringstream ss(corpus);
     std::string raw_word;
     std::vector<std::string> all_parsed_words;
@@ -657,7 +668,6 @@ bool load_and_tokenize_corpus(const std::string& filename, std::vector<int>& tra
     while (ss >> raw_word) {
         std::string cleaned = "";
         
-        // Preserve special tokens like <|endoftext|> intact
         if (raw_word == "<|endoftext|>") {
             cleaned = "<|endoftext|>";
         } else {
@@ -674,18 +684,15 @@ bool load_and_tokenize_corpus(const std::string& filename, std::vector<int>& tra
         word_counts[cleaned]++;
     }
 
-    // Step 2: Sort unique words by frequency (descending)
     std::vector<std::pair<std::string, int>> sorted_vocab(word_counts.begin(), word_counts.end());
     std::sort(sorted_vocab.begin(), sorted_vocab.end(), [](const auto& a, const auto& b) {
-        return a.second > b.second; // Higher frequency first
+        return a.second > b.second;
     });
 
-    // Step 3: Initialize fixed special tokens
     word_to_id["<unk>"] = 0;
     snprintf(VOCAB_WORDS[0], sizeof(VOCAB_WORDS[0]), "%s", "<unk>");
     VOCAB = 1;
 
-    // Ensure <|endoftext|> gets a high-priority slot if present
     bool has_endoftext = false;
     for (const auto& pair : sorted_vocab) {
         if (pair.first == "<|endoftext|>") {
@@ -700,26 +707,23 @@ bool load_and_tokenize_corpus(const std::string& filename, std::vector<int>& tra
         VOCAB++;
     }
 
-    // Fill the rest of the vocabulary up to MAX_VOCAB based on frequency
     for (const auto& pair : sorted_vocab) {
-        if (pair.first == "<|endoftext|>") continue; // already added
+        if (pair.first == "<|endoftext|>") continue;
 
         if (VOCAB < MAX_VOCAB) {
             word_to_id[pair.first] = VOCAB;
             snprintf(VOCAB_WORDS[VOCAB], sizeof(VOCAB_WORDS[VOCAB]), "%s", pair.first.c_str());
             VOCAB++;
         } else {
-            // Stop once vocabulary limit is reached
             break;
         }
     }
 
-    // Step 4: Map all parsed words into final training IDs
     for (const std::string& cleaned : all_parsed_words) {
         if (word_to_id.find(cleaned) != word_to_id.end()) {
             training_word_ids.push_back(word_to_id[cleaned]);
         } else {
-            training_word_ids.push_back(0); // Map to <unk> if cut off by MAX_VOCAB
+            training_word_ids.push_back(0);
         }
     }
 
@@ -729,42 +733,38 @@ bool load_and_tokenize_corpus(const std::string& filename, std::vector<int>& tra
 
 int main(int argc, char* argv[])
 {
-    std::string trainingFile = "TinyStories-valid.txt";
-    std::string modelFile = "tinystories_model.bin";
     std::map<std::string, int> word_to_id;
     std::vector<int> training_word_ids;
 
-    if (!load_and_tokenize_corpus(trainingFile, training_word_ids, word_to_id)) {
+    if (!load_and_tokenize_corpus(TRAINING_FILE, training_word_ids, word_to_id)) {
         return 1;
     }
 
     initialize_weights();
 
-    // Check if the saved model file already exists
-    std::ifstream check_file(modelFile, std::ios::binary);
+    std::ifstream check_file(MODEL_FILE, std::ios::binary);
     bool model_exists = check_file.is_open();
     if (model_exists) {
         check_file.close();
     }
 
     if (model_exists) {
-        printf("Found existing model '%s'. Skipping training and loading weights...\n", modelFile.c_str());
-        load_model(modelFile);
+        printf("Found existing model '%s'. Skipping training and loading weights...\n", MODEL_FILE);
+        load_model(MODEL_FILE);
     } else {
         int total_train_words = training_word_ids.size();
-        if (total_train_words <= SEQ_LEN) {
-            fprintf(stderr, "Error: Corpus is too short for SEQ_LEN (%d).\n", SEQ_LEN);
+        if (total_train_words <= Context_LEN) {
+            fprintf(stderr, "Error: Corpus is too short for Context_LEN (%d).\n", Context_LEN);
             return 1;
         }
 
-        int tokens[SEQ_LEN], targets[SEQ_LEN];
-        const int N_STEPS = 20000;
+        int tokens[Context_LEN], targets[Context_LEN];
 
         printf("Training for %d steps ...\n", N_STEPS);
 
         for (int step = 0; step < N_STEPS; step++) {
-            int start_idx = rng() % (total_train_words - SEQ_LEN);
-            for (int i = 0; i < SEQ_LEN; i++) {
+            int start_idx = rng() % (total_train_words - Context_LEN);
+            for (int i = 0; i < Context_LEN; i++) {
                 tokens[i]  = training_word_ids[start_idx + i];
                 targets[i] = training_word_ids[start_idx + i + 1];
             }
@@ -772,19 +772,17 @@ int main(int argc, char* argv[])
             float current_lr = get_lr(step, N_STEPS);
 
             zero_grads();
-            float loss = forward_pass(tokens, targets, SEQ_LEN);
-            backward_pass(tokens, targets, SEQ_LEN);
+            float loss = forward_pass(tokens, targets, Context_LEN);
+            backward_pass(tokens, targets, Context_LEN);
             sgd_step(current_lr);
 
             if (step % 4000 == 0 || step == N_STEPS - 1)
                 printf("  step %5d: loss %.6f (lr: %.6f) [Time: %.1fs]\n", step, loss, current_lr, (float)clock() / CLOCKS_PER_SEC);
         }
 
-        // Save weights after training completes
-        save_model(modelFile);
+        save_model(MODEL_FILE);
     }
 
-    // Process command-line prompt arguments properly as a combined string
     std::vector<int> prompt_ids;
     if (argc > 1) {
         std::string full_prompt = "";
@@ -794,15 +792,14 @@ int main(int argc, char* argv[])
         prompt_ids = prompt_to_vector(full_prompt, word_to_id);
     }
 
-    // Default prompt fallback if none provided
     if (prompt_ids.empty()) {
         std::string default_prompt = "once upon a time";
         printf("No valid command-line prompt provided. Using default: \"%s\"\n", default_prompt.c_str());
         prompt_ids = prompt_to_vector(default_prompt, word_to_id);
     }
 
-    int prompt_len = std::min((int)prompt_ids.size(), SEQ_LEN);
-    generate_words(prompt_ids.data(), prompt_len, 100); // Set to 30 new tokens for a complete thought
+    int prompt_len = std::min((int)prompt_ids.size(), Context_LEN);
+    generate_words(prompt_ids.data(), prompt_len, MAX_NEW_TOKENS);
 
     return 0;
 }
