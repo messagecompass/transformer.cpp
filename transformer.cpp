@@ -18,24 +18,25 @@
 // ============================================================================
 
 // Model Architecture
-const int   MAX_VOCAB      = 12000;
-const int   Context_LEN    = 100;      
+const int   MAX_VOCAB      = 4900;
+const int   Context_LEN    = 128;      
 const int   N_LAYERS       = 4;
-const int   D_MODEL        = 64;      
+const int   D_MODEL        = 128;      
 const int   N_HEADS        = 4;
 const int   D_HEAD         = D_MODEL / N_HEADS;   
 const int   D_MLP          = D_MODEL * 4;          
 
 // Training Settings
-const int   N_STEPS        = 40000;
+const int   N_STEPS        = 100000;
 const int   WARMUP_STEPS   = 1000;
 const float MAX_LR         = 0.003f;
 const float MIN_LR         = 0.0001f;
+const float EARLY_STOP_LOSS = 2.0f;
 
 // Generation & File Settings
 const int   MAX_NEW_TOKENS = 100;
-const char* TRAINING_FILE  = "TinyStories-valid.txt";
-const char* MODEL_FILE     = "tinystories_model.bin";
+const char* TRAINING_FILE  = "aesop_fables.txt";//"TinyStories-valid.txt";
+const char* MODEL_FILE     = "aesop_fables.bin"; //"tinystories_model.bin";
 
 // ============================================================================
 
@@ -72,6 +73,9 @@ float g_ln_final_scale[D_MODEL];
 float g_ln_final_bias  [D_MODEL];
 float g_W_unembed[MAX_VOCAB][D_MODEL];
 
+float pos_embedding[Context_LEN][D_MODEL];
+float g_pos_embedding[Context_LEN][D_MODEL];
+
 float s_xhat_attn[N_LAYERS][Context_LEN][D_MODEL];
 float s_inv_std_attn[N_LAYERS][Context_LEN];
 float s_normed_attn[N_LAYERS][Context_LEN][D_MODEL];
@@ -101,8 +105,25 @@ float d_v[N_HEADS][Context_LEN][D_HEAD];
 std::mt19937 rng(42);
 
 // GeLU activation function and its derivative
-inline float relu(float x) { return x > 0.0f ? x : 0.0f; }
-inline float relu_grad(float x) { return x > 0.0f ? 1.0f : 0.0f; }
+inline float gelu(float x) {
+    return 0.5f * x * (1.0f + tanhf(0.7978845608f * (x + 0.044715f * x * x)));
+}
+
+inline float gelu_grad(float x) {
+    const float kAlpha = 0.7978845608f;
+    const float kBeta  = 0.044715f;
+
+    float x2 = x * x;
+    float tanh_arg = kAlpha * (x + kBeta * x2);
+    float tanh_val = tanhf(tanh_arg);
+
+    float left = 0.5f * (1.0f + tanh_val);
+    float right = 0.5f * x * (1.0f - tanh_val * tanh_val) *
+                  kAlpha * (1.0f + 2.0f * kBeta * x);
+
+    return left + right;
+}
+
 
 // Learning rate schedule with warmup and cosine decay
 float get_lr(int step, int total_steps) {
@@ -120,6 +141,8 @@ void initialize_weights()
     auto fill_constant = [&](float* ptr, int size, float val) { for (int i = 0; i < size; i++) ptr[i] = val; };
 
     fill_random(&token_embedding[0][0], VOCAB * D_MODEL);
+    fill_random(&pos_embedding[0][0], Context_LEN * D_MODEL);
+
     for (int layer = 0; layer < N_LAYERS; layer++) {
         for (int h = 0; h < N_HEADS; h++) {
             fill_random(&W_Q[layer][h][0][0], D_HEAD * D_MODEL);
@@ -128,7 +151,9 @@ void initialize_weights()
         }
         fill_random(&W_O[layer][0][0], D_MODEL * D_MODEL);
         fill_random(&W_mlp1[layer][0][0], D_MLP * D_MODEL);
-        fill_random(&W_mlp2[layer][0][D_MLP], D_MODEL * D_MLP); 
+        fill_random(&W_mlp2[layer][0][0], D_MODEL * D_MLP);
+
+
         fill_constant(&ln_attn_scale[layer][0], D_MODEL, 1.0f);
         fill_constant(&ln_attn_bias [layer][0], D_MODEL, 0.0f);
         fill_constant(&ln_mlp_scale [layer][0], D_MODEL, 1.0f);
@@ -187,9 +212,10 @@ void layer_norm_backward(const float* dy, const float* xhat, float inv_std,
         dx[i] = inv_std * (d_xhat[i] - mean_dxhat - xhat[i] * mean_dxhat_xhat);
 }
 
-void zero_grads()
+void zero_gradients()
 {
     memset(g_token_embedding, 0, sizeof(g_token_embedding));
+    memset(g_pos_embedding, 0, sizeof(g_pos_embedding));
     memset(g_W_Q,  0, sizeof(g_W_Q));
     memset(g_W_K,  0, sizeof(g_W_K));
     memset(g_W_V,  0, sizeof(g_W_V));
@@ -209,7 +235,7 @@ float forward_pass(int* tokens, int* targets, int seq_len)
 {
     for (int pos = 0; pos < seq_len; pos++)
         for (int d = 0; d < D_MODEL; d++)
-            residual[pos][d] = token_embedding[tokens[pos]][d];
+            residual[pos][d] = token_embedding[tokens[pos]][d] + pos_embedding[pos][d];
 
     float scale = 1.0f / sqrtf((float)D_HEAD);
 
@@ -310,11 +336,13 @@ float forward_pass(int* tokens, int* targets, int seq_len)
                 float val = 0.0f;
                 const float* w_mlp2_ptr = W_mlp2[layer][d];
                 for (int m = 0; m < D_MLP; m++) {
-                    float gelu_out = relu(s_mlp_pre_relu[layer][pos][m]);
+                    float gelu_out = gelu(s_mlp_pre_relu[layer][pos][m]);
                     val += w_mlp2_ptr[m] * gelu_out;
                 }
                 residual[pos][d] += val;
+
             }
+
         }
     }
 
@@ -392,13 +420,13 @@ void backward_pass(int* tokens, int* targets, int seq_len)
 
             for (int d = 0; d < D_MODEL; d++)
                 for (int m = 0; m < D_MLP; m++) {
-                    float gelu_val = relu(s_mlp_pre_relu[layer][pos][m]);
+                    float gelu_val = gelu(s_mlp_pre_relu[layer][pos][m]);
                     g_W_mlp2[layer][d][m] += d_residual[pos][d] * gelu_val;
                 }
 
             float d_pre_gelu[D_MLP];
             for (int m = 0; m < D_MLP; m++)
-                d_pre_gelu[m] = d_gelu_out[m] * relu_grad(s_mlp_pre_relu[layer][pos][m]);
+                d_pre_gelu[m] = d_gelu_out[m] * gelu_grad(s_mlp_pre_relu[layer][pos][m]);
 
             float d_normed_mlp_pos[D_MODEL];
             for (int d = 0; d < D_MODEL; d++) {
@@ -448,9 +476,12 @@ void backward_pass(int* tokens, int* targets, int seq_len)
                     }
 
                 float dot = 0.0f;
-                for (int j = 0; j < seq_len; j++) dot += d_attn_w[j] * s_attn_w[layer][h][i][j];
+                for (int j = 0; j <= i; j++)
+                    dot += d_attn_w[j] * s_attn_w[layer][h][i][j];
+
                 float d_score[Context_LEN];
-                for (int j = 0; j < seq_len; j++) d_score[j] = s_attn_w[layer][h][i][j] * (d_attn_w[j] - dot);
+                for (int j = 0; j <= i; j++)
+                    d_score[j] = s_attn_w[layer][h][i][j] * (d_attn_w[j] - dot);
 
                 for (int j = 0; j <= i; j++)
                     for (int dh = 0; dh < D_HEAD; dh++) {
@@ -483,7 +514,10 @@ void backward_pass(int* tokens, int* targets, int seq_len)
 
     for (int pos = 0; pos < seq_len; pos++)
         for (int d = 0; d < D_MODEL; d++)
+        {
             g_token_embedding[tokens[pos]][d] += d_residual[pos][d];
+            g_pos_embedding[pos][d] += d_residual[pos][d];
+        }
 }
 
 void sgd_step(float lr)
@@ -493,6 +527,7 @@ void sgd_step(float lr)
             ((float*)(w))[_i] -= lr * ((float*)(gw))[_i];
 
     UPDATE(token_embedding, g_token_embedding, VOCAB * D_MODEL);
+    UPDATE(pos_embedding, g_pos_embedding, Context_LEN * D_MODEL);
     UPDATE(W_Q, g_W_Q, N_LAYERS * N_HEADS * D_HEAD * D_MODEL);
     UPDATE(W_K, g_W_K, N_LAYERS * N_HEADS * D_HEAD * D_MODEL);
     UPDATE(W_V, g_W_V, N_LAYERS * N_HEADS * D_HEAD * D_MODEL);
@@ -542,6 +577,7 @@ void save_model(const std::string& filename)
     }
 
     file.write((char*)token_embedding, sizeof(token_embedding));
+    file.write((char*)pos_embedding, sizeof(pos_embedding));
     file.write((char*)W_Q, sizeof(W_Q));
     file.write((char*)W_K, sizeof(W_K));
     file.write((char*)W_V, sizeof(W_V));
@@ -569,6 +605,7 @@ void load_model(const std::string& filename)
     }
 
     file.read((char*)token_embedding, sizeof(token_embedding));
+    file.read((char*)pos_embedding, sizeof(pos_embedding));
     file.read((char*)W_Q, sizeof(W_Q));
     file.read((char*)W_K, sizeof(W_K));
     file.read((char*)W_V, sizeof(W_V));
@@ -589,37 +626,42 @@ void load_model(const std::string& filename)
 
 void generate_words(const int* prompt_ids, int prompt_len, int max_new_tokens)
 {
-    int current_tokens[Context_LEN];
-    for (int i = 0; i < Context_LEN; i++) current_tokens[i] = 0;
-
+    std::vector<int> current_tokens;
     for (int i = 0; i < prompt_len && i < Context_LEN; i++) {
-        current_tokens[i] = prompt_ids[i];
+        current_tokens.push_back(prompt_ids[i]);
     }
 
     printf("\n--- Generating Words ---\nPrompt: ");
-    for (int i = 0; i < prompt_len; i++) {
-        printf("%s ", VOCAB_WORDS[prompt_ids[i]]);
+    for (int id : current_tokens) {
+        printf("%s ", VOCAB_WORDS[id]);
     }
     printf("\nOutput: ");
-    for (int i = 0; i < prompt_len; i++) {
-        printf("%s ", VOCAB_WORDS[prompt_ids[i]]);
+    for (int id : current_tokens) {
+        printf("%s ", VOCAB_WORDS[id]);
     }
 
     for (int t = 0; t < max_new_tokens; t++) {
-        forward_pass(current_tokens, current_tokens, Context_LEN);
+        int seq_len = (int)current_tokens.size();
+        if (seq_len > Context_LEN) break;
 
-        int last_pos = 0;
-        for (int i = 0; i < Context_LEN; i++) {
-            if (current_tokens[i] != 0) last_pos = i;
-        }
+        // Pass ONLY the actual active prompt/generated sequence length
+        forward_pass(current_tokens.data(), current_tokens.data(), seq_len);
 
-        for (int i = 0; i < Context_LEN; i++) {
+        int last_pos = seq_len - 1;
+
+        // Repetition penalty on recently generated tokens
+        for (int i = 0; i < seq_len; i++) {
             int recent_word = current_tokens[i];
             if (recent_word > 0 && recent_word < VOCAB) {
-                logits[last_pos][recent_word] *= 0.05f;
+                if (logits[last_pos][recent_word] > 0) {
+                    logits[last_pos][recent_word] *= 0.05f;
+                } else {
+                    logits[last_pos][recent_word] *= 1.95f; // Penalize negative logits properly
+                }
             }
         }
 
+        // Greedy sampling (Argmax) at the exact last valid prediction index
         int best_token = 0;
         float max_logit = logits[last_pos][0];
         for (int v = 1; v < VOCAB; v++) {
@@ -631,10 +673,8 @@ void generate_words(const int* prompt_ids, int prompt_len, int max_new_tokens)
 
         printf("%s ", VOCAB_WORDS[best_token]);
 
-        for (int i = 0; i < Context_LEN - 1; i++) {
-            current_tokens[i] = current_tokens[i + 1];
-        }
-        current_tokens[Context_LEN - 1] = best_token;
+        current_tokens.push_back(best_token);
+
         if (std::string(VOCAB_WORDS[best_token]) == "<|endoftext|>") {
             printf("\n[Reached end of text]\n");
             break;
@@ -673,7 +713,7 @@ bool load_and_tokenize_corpus(const std::string& filename, std::vector<int>& tra
         } else {
             for (char c : raw_word) {
                 if (c != '.' && c != ',' && c != ':' && c != '"' && c != ';') {
-                    cleaned += tolower(c);
+                    
                 }
             }
         }
@@ -731,75 +771,55 @@ bool load_and_tokenize_corpus(const std::string& filename, std::vector<int>& tra
     return true;
 }
 
-int main(int argc, char* argv[])
+void inference(const std::string& prompt, 
+               const std::map<std::string,int>& word_to_id)
 {
-    std::map<std::string, int> word_to_id;
-    std::vector<int> training_word_ids;
+    auto prompt_ids = prompt_to_vector(prompt, word_to_id);
+    generate_words(prompt_ids.data(), prompt_ids.size(), MAX_NEW_TOKENS);
+}
 
-    if (!load_and_tokenize_corpus(TRAINING_FILE, training_word_ids, word_to_id)) {
-        return 1;
+void train(const std::vector<int>& training_word_ids)
+{
+    int tokens[Context_LEN];
+    int targets[Context_LEN];
+
+    for (int step = 0; step < N_STEPS; step++) {
+
+        zero_gradients();
+
+        int start = rng() % (training_word_ids.size() - Context_LEN);
+        for (int i = 0; i < Context_LEN; i++) {
+            tokens[i]  = training_word_ids[start + i];
+            targets[i] = training_word_ids[start + i + 1];
+        }
+
+        float lr = get_lr(step, N_STEPS);
+        float loss = forward_pass(tokens, targets, Context_LEN);
+        backward_pass(tokens, targets, Context_LEN);
+        sgd_step(lr);
+
+        if (step % 4000 == 0)
+            printf("step %d loss %.4f\n", step, loss);
     }
 
+    save_model(MODEL_FILE);
+}
+
+int main()
+{
+    std::map<std::string,int> word_to_id;
+    std::vector<int> training_word_ids;
+
+    load_and_tokenize_corpus(TRAINING_FILE, training_word_ids, word_to_id);
     initialize_weights();
 
-    std::ifstream check_file(MODEL_FILE, std::ios::binary);
+        std::ifstream check_file(MODEL_FILE, std::ios::binary);
     bool model_exists = check_file.is_open();
     if (model_exists) {
         check_file.close();
-    }
-
-    if (model_exists) {
-        printf("Found existing model '%s'. Skipping training and loading weights...\n", MODEL_FILE);
         load_model(MODEL_FILE);
+        inference("A Frog and a", word_to_id);
     } else {
-        int total_train_words = training_word_ids.size();
-        if (total_train_words <= Context_LEN) {
-            fprintf(stderr, "Error: Corpus is too short for Context_LEN (%d).\n", Context_LEN);
-            return 1;
-        }
-
-        int tokens[Context_LEN], targets[Context_LEN];
-
-        printf("Training for %d steps ...\n", N_STEPS);
-
-        for (int step = 0; step < N_STEPS; step++) {
-            int start_idx = rng() % (total_train_words - Context_LEN);
-            for (int i = 0; i < Context_LEN; i++) {
-                tokens[i]  = training_word_ids[start_idx + i];
-                targets[i] = training_word_ids[start_idx + i + 1];
-            }
-
-            float current_lr = get_lr(step, N_STEPS);
-
-            zero_grads();
-            float loss = forward_pass(tokens, targets, Context_LEN);
-            backward_pass(tokens, targets, Context_LEN);
-            sgd_step(current_lr);
-
-            if (step % 4000 == 0 || step == N_STEPS - 1)
-                printf("  step %5d: loss %.6f (lr: %.6f) [Time: %.1fs]\n", step, loss, current_lr, (float)clock() / CLOCKS_PER_SEC);
-        }
-
-        save_model(MODEL_FILE);
+        train(training_word_ids);
     }
-
-    std::vector<int> prompt_ids;
-    if (argc > 1) {
-        std::string full_prompt = "";
-        for (int c = 1; c < argc; c++) {
-            full_prompt += std::string(argv[c]) + " ";
-        }
-        prompt_ids = prompt_to_vector(full_prompt, word_to_id);
-    }
-
-    if (prompt_ids.empty()) {
-        std::string default_prompt = "once upon a time";
-        printf("No valid command-line prompt provided. Using default: \"%s\"\n", default_prompt.c_str());
-        prompt_ids = prompt_to_vector(default_prompt, word_to_id);
-    }
-
-    int prompt_len = std::min((int)prompt_ids.size(), Context_LEN);
-    generate_words(prompt_ids.data(), prompt_len, MAX_NEW_TOKENS);
-
-    return 0;
 }
