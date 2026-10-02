@@ -2,3 +2,8 @@
 tinystories_model.bin
 train
 transformer.txt
+aesop_fables.bin_tokens.txt
+.gitignore
+.gitignore
+aesop_fables.bin
+tinystories_model.bin_tokens.txt

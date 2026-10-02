@@ -27,16 +27,16 @@ const int   D_HEAD         = D_MODEL / N_HEADS;
 const int   D_MLP          = D_MODEL * 4;          
 
 // Training Settings
-const int   N_STEPS        = 100000;
+const int   N_STEPS        = 10000;
 const int   WARMUP_STEPS   = 1000;
-const float MAX_LR         = 0.003f;
+const float MAX_LR         = 0.001f;
 const float MIN_LR         = 0.0001f;
 const float EARLY_STOP_LOSS = 2.0f;
 
 // Generation & File Settings
 const int   MAX_NEW_TOKENS = 100;
-const char* TRAINING_FILE  = "aesop_fables.txt";//"TinyStories-valid.txt";
-const char* MODEL_FILE     = "aesop_fables.bin"; //"tinystories_model.bin";
+const char* TRAINING_FILE  = "TinyStories-valid.txt";//"aesop_fables.txt";//
+const char* MODEL_FILE     = "tinystories_model.bin";//"aesop_fables.bin"; //
 
 // ============================================================================
 
@@ -102,6 +102,66 @@ float d_q[N_HEADS][Context_LEN][D_HEAD];
 float d_k[N_HEADS][Context_LEN][D_HEAD];
 float d_v[N_HEADS][Context_LEN][D_HEAD];
 
+// ============================================================================
+// ADAMW OPTIMIZER BUFFERS (1st and 2nd moments)
+// ============================================================================
+float m_token_embedding[MAX_VOCAB][D_MODEL], v_token_embedding[MAX_VOCAB][D_MODEL];
+float m_W_Q[N_LAYERS][N_HEADS][D_HEAD][D_MODEL], v_W_Q[N_LAYERS][N_HEADS][D_HEAD][D_MODEL];
+float m_W_K[N_LAYERS][N_HEADS][D_HEAD][D_MODEL], v_W_K[N_LAYERS][N_HEADS][D_HEAD][D_MODEL];
+float m_W_V[N_LAYERS][N_HEADS][D_HEAD][D_MODEL], v_W_V[N_LAYERS][N_HEADS][D_HEAD][D_MODEL];
+float m_W_O[N_LAYERS][D_MODEL][D_MODEL], v_W_O[N_LAYERS][D_MODEL][D_MODEL];
+float m_W_mlp1[N_LAYERS][D_MLP][D_MODEL], v_W_mlp1[N_LAYERS][D_MLP][D_MODEL];
+float m_W_mlp2[N_LAYERS][D_MODEL][D_MLP], v_W_mlp2[N_LAYERS][D_MODEL][D_MLP];
+float m_ln_attn_scale[N_LAYERS][D_MODEL], v_ln_attn_scale[N_LAYERS][D_MODEL];
+float m_ln_attn_bias [N_LAYERS][D_MODEL], v_ln_attn_bias [N_LAYERS][D_MODEL];
+float m_ln_mlp_scale [N_LAYERS][D_MODEL], v_ln_mlp_scale [N_LAYERS][D_MODEL];
+float m_ln_mlp_bias  [N_LAYERS][D_MODEL], v_ln_mlp_bias  [N_LAYERS][D_MODEL];
+float m_ln_final_scale[D_MODEL], v_ln_final_scale[D_MODEL];
+float m_ln_final_bias [D_MODEL], v_ln_final_bias [D_MODEL];
+float m_W_unembed[MAX_VOCAB][D_MODEL], v_W_unembed[MAX_VOCAB][D_MODEL];
+float m_pos_embedding[Context_LEN][D_MODEL], v_pos_embedding[Context_LEN][D_MODEL];
+void adamw_step(float lr, int t_step, float beta1 = 0.9f, float beta2 = 0.999f, float eps = 1e-8f, float weight_decay = 0.01f)
+{
+    // Bias correction factors
+    float bias_correction1 = 1.0f - powf(beta1, t_step + 1);
+    float bias_correction2 = 1.0f - powf(beta2, t_step + 1);
+
+    #define ADAMW_UPDATE(w, gw, m, v, size) \
+        for (int i = 0; i < (size); i++) { \
+            float* w_ptr  = ((float*)(w)) + i; \
+            float* g_ptr  = ((float*)(gw)) + i; \
+            float* m_ptr  = ((float*)(m)) + i; \
+            float* v_ptr  = ((float*)(v)) + i; \
+            /* Decoupled Weight Decay */ \
+            *w_ptr -= lr * weight_decay * (*w_ptr); \
+            /* Update 1st and 2nd moment estimates */ \
+            *m_ptr = beta1 * (*m_ptr) + (1.0f - beta1) * (*g_ptr); \
+            *v_ptr = beta2 * (*v_ptr) + (1.0f - beta2) * (*g_ptr) * (*g_ptr); \
+            /* Bias-corrected moment estimates */ \
+            float m_hat = *m_ptr / bias_correction1; \
+            float v_hat = *v_ptr / bias_correction2; \
+            /* Parameter Update */ \
+            *w_ptr -= lr * m_hat / (sqrtf(v_hat) + eps); \
+        }
+
+    ADAMW_UPDATE(token_embedding, g_token_embedding, m_token_embedding, v_token_embedding, VOCAB * D_MODEL);
+    ADAMW_UPDATE(pos_embedding, g_pos_embedding, m_pos_embedding, v_pos_embedding, Context_LEN * D_MODEL);
+    ADAMW_UPDATE(W_Q, g_W_Q, m_W_Q, v_W_Q, N_LAYERS * N_HEADS * D_HEAD * D_MODEL);
+    ADAMW_UPDATE(W_K, g_W_K, m_W_K, v_W_K, N_LAYERS * N_HEADS * D_HEAD * D_MODEL);
+    ADAMW_UPDATE(W_V, g_W_V, m_W_V, v_W_V, N_LAYERS * N_HEADS * D_HEAD * D_MODEL);
+    ADAMW_UPDATE(W_O, g_W_O, m_W_O, v_W_O, N_LAYERS * D_MODEL * D_MODEL);
+    ADAMW_UPDATE(W_mlp1, g_W_mlp1, m_W_mlp1, v_W_mlp1, N_LAYERS * D_MLP * D_MODEL);
+    ADAMW_UPDATE(W_mlp2, g_W_mlp2, m_W_mlp2, v_W_mlp2, N_LAYERS * D_MODEL * D_MLP);
+    ADAMW_UPDATE(ln_attn_scale, g_ln_attn_scale, m_ln_attn_scale, v_ln_attn_scale, N_LAYERS * D_MODEL);
+    ADAMW_UPDATE(ln_attn_bias,  g_ln_attn_bias,  m_ln_attn_bias,  v_ln_attn_bias,  N_LAYERS * D_MODEL);
+    ADAMW_UPDATE(ln_mlp_scale,  g_ln_mlp_scale,  m_ln_mlp_scale,  v_ln_mlp_scale,  N_LAYERS * D_MODEL);
+    ADAMW_UPDATE(ln_mlp_bias,   g_ln_mlp_bias,   m_ln_mlp_bias,   v_ln_mlp_bias,   N_LAYERS * D_MODEL);
+    ADAMW_UPDATE(ln_final_scale, g_ln_final_scale, m_ln_final_scale, v_ln_final_scale, D_MODEL);
+    ADAMW_UPDATE(ln_final_bias,  g_ln_final_bias,  m_ln_final_bias,  v_ln_final_bias,  D_MODEL);
+    ADAMW_UPDATE(W_unembed, g_W_unembed, m_W_unembed, v_W_unembed, VOCAB * D_MODEL);
+
+    #undef ADAMW_UPDATE
+}
 std::mt19937 rng(42);
 
 // GeLU activation function and its derivative
@@ -551,18 +611,27 @@ std::vector<int> prompt_to_vector(const std::string& prompt_str, const std::map<
     std::string raw_word;
 
     while (ss >> raw_word) {
-        std::string cleaned = "";
+        std::string current_word = "";
         for (char c : raw_word) {
-            if (c != '.' && c != ',' && c != ':' && c != '"' && c != ';') {
-                cleaned += tolower(c);
+            if (ispunct(c) && c != '\'' && c != '-') {
+                if (!current_word.empty()) {
+                    if (word_to_id.find(current_word) != word_to_id.end()) {
+                        prompt_ids.push_back(word_to_id.at(current_word));
+                    }
+                    current_word = "";
+                }
+                std::string p(1, c);
+                if (word_to_id.find(p) != word_to_id.end()) {
+                    prompt_ids.push_back(word_to_id.at(p));
+                }
+            } else {
+                current_word += tolower(c);
             }
         }
-        if (cleaned.empty()) continue;
-
-        if (word_to_id.find(cleaned) != word_to_id.end()) {
-            prompt_ids.push_back(word_to_id.at(cleaned));
-        } else {
-            printf("Warning: Prompt word '%s' not found in vocabulary. Ignored.\n", raw_word.c_str());
+        if (!current_word.empty()) {
+            if (word_to_id.find(current_word) != word_to_id.end()) {
+                prompt_ids.push_back(word_to_id.at(current_word));
+            }
         }
     }
     return prompt_ids;
@@ -640,47 +709,122 @@ void generate_words(const int* prompt_ids, int prompt_len, int max_new_tokens)
         printf("%s ", VOCAB_WORDS[id]);
     }
 
+    // Sampling parameters
+    const float temperature = 0.7f; // Lower = more focused, Higher = more creative
+    const int top_k = 20;           // Only sample from the top 20 most likely words
+    const float penalty = 1.2f;     // Mild additive penalty
+
     for (int t = 0; t < max_new_tokens; t++) {
         int seq_len = (int)current_tokens.size();
         if (seq_len > Context_LEN) break;
 
-        // Pass ONLY the actual active prompt/generated sequence length
         forward_pass(current_tokens.data(), current_tokens.data(), seq_len);
-
         int last_pos = seq_len - 1;
 
-        // Repetition penalty on recently generated tokens
-        for (int i = 0; i < seq_len; i++) {
+        // 1. Gentle Additive Repetition Penalty (Last 15 tokens only)
+        int lookback = std::max(0, seq_len - 15);
+        for (int i = lookback; i < seq_len; i++) {
             int recent_word = current_tokens[i];
             if (recent_word > 0 && recent_word < VOCAB) {
-                if (logits[last_pos][recent_word] > 0) {
-                    logits[last_pos][recent_word] *= 0.05f;
-                } else {
-                    logits[last_pos][recent_word] *= 1.95f; // Penalize negative logits properly
-                }
+                logits[last_pos][recent_word] -= penalty;
             }
         }
 
-        // Greedy sampling (Argmax) at the exact last valid prediction index
-        int best_token = 0;
+        // 2. Temperature Scaling
+        for (int v = 0; v < VOCAB; v++) {
+            logits[last_pos][v] /= temperature;
+        }
+
+        // 3. Find Max Logit for Softmax Numerical Stability
         float max_logit = logits[last_pos][0];
         for (int v = 1; v < VOCAB; v++) {
-            if (logits[last_pos][v] > max_logit) {
-                max_logit = logits[last_pos][v];
-                best_token = v;
+            if (logits[last_pos][v] > max_logit) max_logit = logits[last_pos][v];
+        }
+
+        // 4. Compute Softmax Probabilities & Gather Top-K
+        std::vector<std::pair<float, int>> probs(VOCAB);
+        float sum_exp = 0.0f;
+        for (int v = 0; v < VOCAB; v++) {
+            float exp_val = expf(logits[last_pos][v] - max_logit);
+            probs[v] = {exp_val, v};
+            sum_exp += exp_val;
+        }
+
+        // Sort logits descending
+        std::sort(probs.rbegin(), probs.rend());
+
+        // 5. Sample from Top-K Candidates
+        int actual_k = std::min(top_k, VOCAB);
+        float top_k_sum = 0.0f;
+        for (int i = 0; i < actual_k; i++) {
+            top_k_sum += probs[i].first;
+        }
+
+        std::uniform_real_distribution<float> dist(0.0f, top_k_sum);
+        float r = dist(rng);
+        float accum = 0.0f;
+        int chosen_token = probs[0].second;
+
+        for (int i = 0; i < actual_k; i++) {
+            accum += probs[i].first;
+            if (r <= accum) {
+                chosen_token = probs[i].second;
+                break;
             }
         }
 
-        printf("%s ", VOCAB_WORDS[best_token]);
+        std::string token_str = VOCAB_WORDS[chosen_token];
+        if (token_str == "." || token_str == "," || token_str == "?" || token_str == "!" || token_str == ":" || token_str == ";")
+        {
+            printf("%s", token_str.c_str());
+        }
+        else
+        {
+            printf(" %s", token_str.c_str());
+        }
 
-        current_tokens.push_back(best_token);
+        current_tokens.push_back(chosen_token);
 
-        if (std::string(VOCAB_WORDS[best_token]) == "<|endoftext|>") {
+        if (std::string(VOCAB_WORDS[chosen_token]) == "<|endoftext|>") {
             printf("\n[Reached end of text]\n");
             break;
         }
     }
     printf("\n------------------------\n");
+}
+
+void save_token_report(
+    const std::string& model_file,
+    const std::vector<std::pair<std::string, int>>& sorted_vocab,
+    const std::map<std::string, int>& word_to_id)
+{
+    std::string report_file = model_file + std::string("_tokens.txt");
+
+    std::ofstream out(report_file);
+    if (!out.is_open()) {
+        printf("Failed to create token report '%s'\n", report_file.c_str());
+        return;
+    }
+
+    out << "TOKEN_ID\tFREQUENCY\tWORD\n";
+
+    out << "0\tN/A\t<unk>\n";
+
+    for (const auto& p : sorted_vocab) {
+        auto it = word_to_id.find(p.first);
+        if (it == word_to_id.end())
+            continue;
+
+        out << it->second
+            << '\t'
+            << p.second
+            << '\t'
+            << p.first
+            << '\n';
+    }
+
+    out.close();
+    printf("Token report saved to '%s'\n", report_file.c_str());
 }
 
 bool load_and_tokenize_corpus(const std::string& filename, std::vector<int>& training_word_ids, std::map<std::string, int>& word_to_id)
@@ -701,38 +845,54 @@ bool load_and_tokenize_corpus(const std::string& filename, std::vector<int>& tra
     }
 
     std::stringstream ss(corpus);
-    std::string raw_word;
-    std::vector<std::string> all_parsed_words;
-    std::map<std::string, int> word_counts;
+    std::string raw_token;
+    std::vector<std::string> all_parsed_tokens;
+    std::map<std::string, int> token_counts;
 
-    while (ss >> raw_word) {
-        std::string cleaned = "";
-        
-        if (raw_word == "<|endoftext|>") {
-            cleaned = "<|endoftext|>";
-        } else {
-            for (char c : raw_word) {
-                if (c != '.' && c != ',' && c != ':' && c != '"' && c != ';') {
-                    
-                }
-            }
+    while (ss >> raw_token) {
+        if (raw_token == "<|endoftext|>") {
+            all_parsed_tokens.push_back("<|endoftext|>");
+            token_counts["<|endoftext|>"]++;
+            continue;
         }
 
-        if (cleaned.empty()) continue;
-        
-        all_parsed_words.push_back(cleaned);
-        word_counts[cleaned]++;
+        std::string current_word = "";
+        for (size_t i = 0; i < raw_token.size(); i++) {
+            char c = raw_token[i];
+
+            // Separate punctuation marks into standalone tokens
+            if (ispunct(c) && c != '\'' && c != '-') { 
+                if (!current_word.empty()) {
+                    all_parsed_tokens.push_back(current_word);
+                    token_counts[current_word]++;
+                    current_word = "";
+                }
+                // Add punctuation as its own individual token
+                std::string punct_token(1, c);
+                all_parsed_tokens.push_back(punct_token);
+                token_counts[punct_token]++;
+            } else {
+                current_word += tolower(c);
+            }
+        }
+        if (!current_word.empty()) {
+            all_parsed_tokens.push_back(current_word);
+            token_counts[current_word]++;
+        }
     }
 
-    std::vector<std::pair<std::string, int>> sorted_vocab(word_counts.begin(), word_counts.end());
+    // Sort vocabulary by frequency
+    std::vector<std::pair<std::string, int>> sorted_vocab(token_counts.begin(), token_counts.end());
     std::sort(sorted_vocab.begin(), sorted_vocab.end(), [](const auto& a, const auto& b) {
         return a.second > b.second;
     });
 
+    // Token 0: <unk>
     word_to_id["<unk>"] = 0;
     snprintf(VOCAB_WORDS[0], sizeof(VOCAB_WORDS[0]), "%s", "<unk>");
     VOCAB = 1;
 
+    // Token 1: <|endoftext|> (if present)
     bool has_endoftext = false;
     for (const auto& pair : sorted_vocab) {
         if (pair.first == "<|endoftext|>") {
@@ -747,6 +907,7 @@ bool load_and_tokenize_corpus(const std::string& filename, std::vector<int>& tra
         VOCAB++;
     }
 
+    // Assign Token IDs to words and punctuation marks
     for (const auto& pair : sorted_vocab) {
         if (pair.first == "<|endoftext|>") continue;
 
@@ -759,15 +920,17 @@ bool load_and_tokenize_corpus(const std::string& filename, std::vector<int>& tra
         }
     }
 
-    for (const std::string& cleaned : all_parsed_words) {
-        if (word_to_id.find(cleaned) != word_to_id.end()) {
-            training_word_ids.push_back(word_to_id[cleaned]);
+    // Map parsed tokens to vocabulary IDs
+    for (const std::string& token : all_parsed_tokens) {
+        if (word_to_id.find(token) != word_to_id.end()) {
+            training_word_ids.push_back(word_to_id[token]);
         } else {
-            training_word_ids.push_back(0);
+            training_word_ids.push_back(0); // <unk>
         }
     }
 
-    printf("Frequency-based Tokenization Complete. Unique Vocabulary Size: %d words (Max allowed: %d).\n", VOCAB, MAX_VOCAB);
+    printf("Frequency-based Tokenization Complete. Unique Vocabulary Size: %d words/symbols (Max allowed: %d).\n", VOCAB, MAX_VOCAB);
+    save_token_report(MODEL_FILE, sorted_vocab, word_to_id);
     return true;
 }
 
@@ -796,7 +959,7 @@ void train(const std::vector<int>& training_word_ids)
         float lr = get_lr(step, N_STEPS);
         float loss = forward_pass(tokens, targets, Context_LEN);
         backward_pass(tokens, targets, Context_LEN);
-        sgd_step(lr);
+        adamw_step(lr, step);     //sgd_step(lr);
 
         if (step % 4000 == 0)
             printf("step %d loss %.4f\n", step, loss);
@@ -805,21 +968,25 @@ void train(const std::vector<int>& training_word_ids)
     save_model(MODEL_FILE);
 }
 
-int main()
+int main(int argc, char** argv)
 {
+    // Fallback to default prompt if no argument is supplied
+    std::string prompt = (argc > 1) ? argv[1] : "A Frog and a";
+
     std::map<std::string,int> word_to_id;
     std::vector<int> training_word_ids;
 
     load_and_tokenize_corpus(TRAINING_FILE, training_word_ids, word_to_id);
     initialize_weights();
 
-        std::ifstream check_file(MODEL_FILE, std::ios::binary);
+    std::ifstream check_file(MODEL_FILE, std::ios::binary);
     bool model_exists = check_file.is_open();
     if (model_exists) {
         check_file.close();
         load_model(MODEL_FILE);
-        inference("A Frog and a", word_to_id);
     } else {
         train(training_word_ids);
     }
+
+    inference(prompt, word_to_id);
 }
