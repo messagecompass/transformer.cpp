@@ -17,13 +17,8 @@ A complete GPT-style Transformer implemented from scratch in one file with zero 
 
 ## Quick Start
 
-### 1. Clone
 ```bash
 git clone [https://github.com/messagecompass/transformer.cpp.git](https://github.com/messagecompass/transformer.cpp.git)
 cd transformer.cpp
-2. Build
-```bash
 g++ -O3 -std=c++17 transformer.cpp -o transformer
-3. Run
-```bash
 ./transformer "once upon a time"
