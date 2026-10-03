@@ -16,6 +16,11 @@
 // ============================================================================
 // HYPERPARAMETERS & CONFIGURATION (Modify these easily to experiment!)
 // ============================================================================
+// Transformer Architecture Specifications:
+// - Context Length (T): Maximum sequence length the model can process at once.
+// - Embedding Dimension (D_MODEL): Dimension of token & positional embeddings.
+// - Multi-Head Attention: Splits D_MODEL into N_HEADS of size D_HEAD (D_MODEL = N_HEADS * D_HEAD).
+// - Feed-Forward Expansion (D_MLP): Standard GPT convention expands D_MODEL by 4x in the MLP block.
 
 // Model Architecture
 const int   MAX_VOCAB      = 4900;
@@ -27,7 +32,7 @@ const int   D_HEAD         = D_MODEL / N_HEADS;
 const int   D_MLP          = D_MODEL * 4;          
 
 // Training Settings
-const int   N_STEPS        = 10000;
+const int   N_STEPS        = 12000;
 const int   WARMUP_STEPS   = 1000;
 const float MAX_LR         = 0.001f;
 const float MIN_LR         = 0.0001f;
@@ -39,25 +44,50 @@ const char* TRAINING_FILE  = "TinyStories-valid.txt";//"aesop_fables.txt";//
 const char* MODEL_FILE     = "tinystories_model.bin";//"aesop_fables.bin"; //
 
 // ============================================================================
+// MODEL PARAMETERS & GRADIENT BUFFERS
+// ============================================================================
 
 int VOCAB = 0;
 char VOCAB_WORDS[MAX_VOCAB][32];
 
+// ----------------------------------------------------------------------------
+// Model Weights (Parameters)
+// ----------------------------------------------------------------------------
+// 1. Token Embeddings: Maps discrete token IDs to continuous vectors of size D_MODEL.
 float token_embedding[MAX_VOCAB][D_MODEL];
+
+// 2. Multi-Head Attention Weights (per layer):
+//    - W_Q, W_K, W_V: Linear projections to construct Query, Key, and Value vectors.
+//    - W_O: Output projection weight to mix information across all attention heads.
 float W_Q[N_LAYERS][N_HEADS][D_HEAD][D_MODEL];
 float W_K[N_LAYERS][N_HEADS][D_HEAD][D_MODEL];
 float W_V[N_LAYERS][N_HEADS][D_HEAD][D_MODEL];
 float W_O[N_LAYERS][D_MODEL][D_MODEL];
+
+// 3. Feed-Forward / MLP Weights (per layer):
+//    - W_mlp1: Projects D_MODEL -> D_MLP (expansion layer).
+//    - W_mlp2: Projects D_MLP -> D_MODEL (contraction layer).
 float W_mlp1[N_LAYERS][D_MLP][D_MODEL];
 float W_mlp2[N_LAYERS][D_MODEL][D_MLP];
+
+// 4. Layer Normalization Parameters (Gain/Scale & Bias):
+//    - Pre-Attention LayerNorm parameters (ln_attn)
+//    - Pre-MLP LayerNorm parameters (ln_mlp)
+//    - Final LayerNorm parameters before logits projection (ln_final)
 float ln_attn_scale[N_LAYERS][D_MODEL];
 float ln_attn_bias [N_LAYERS][D_MODEL];
 float ln_mlp_scale [N_LAYERS][D_MODEL];
 float ln_mlp_bias  [N_LAYERS][D_MODEL];
 float ln_final_scale[D_MODEL];
 float ln_final_bias [D_MODEL];
+
+// 5. Unembedding Head:
+//    - Maps final hidden state D_MODEL back to vocabulary size to produce logits.
 float W_unembed[MAX_VOCAB][D_MODEL];
 
+// ----------------------------------------------------------------------------
+// Parameter Gradients (Accumulate gradients computed during backward_pass)
+// ----------------------------------------------------------------------------
 float g_token_embedding[MAX_VOCAB][D_MODEL];
 float g_W_Q[N_LAYERS][N_HEADS][D_HEAD][D_MODEL];
 float g_W_K[N_LAYERS][N_HEADS][D_HEAD][D_MODEL];
@@ -73,9 +103,14 @@ float g_ln_final_scale[D_MODEL];
 float g_ln_final_bias  [D_MODEL];
 float g_W_unembed[MAX_VOCAB][D_MODEL];
 
+// 6. Learned Positional Embeddings:
+//    - Self-attention is permutation-invariant. Positional embeddings encode order.
 float pos_embedding[Context_LEN][D_MODEL];
 float g_pos_embedding[Context_LEN][D_MODEL];
 
+// ----------------------------------------------------------------------------
+// Intermediate Activation Saved Memory (Saved during Forward for Backward Pass)
+// ----------------------------------------------------------------------------
 float s_xhat_attn[N_LAYERS][Context_LEN][D_MODEL];
 float s_inv_std_attn[N_LAYERS][Context_LEN];
 float s_normed_attn[N_LAYERS][Context_LEN][D_MODEL];
@@ -92,6 +127,7 @@ float s_xhat_final[Context_LEN][D_MODEL];
 float s_inv_std_final[Context_LEN];
 float s_normed_final[Context_LEN][D_MODEL];
 
+// Residual Stream & Logit Buffers
 float residual[Context_LEN][D_MODEL];
 float logits  [Context_LEN][MAX_VOCAB];
 float d_residual[Context_LEN][D_MODEL];
@@ -105,6 +141,8 @@ float d_v[N_HEADS][Context_LEN][D_HEAD];
 // ============================================================================
 // ADAMW OPTIMIZER BUFFERS (1st and 2nd moments)
 // ============================================================================
+// AdamW keeps track of running averages of past gradients (m) and past squared
+// gradients (v) for adaptive per-parameter learning rates with decoupled weight decay.
 float m_token_embedding[MAX_VOCAB][D_MODEL], v_token_embedding[MAX_VOCAB][D_MODEL];
 float m_W_Q[N_LAYERS][N_HEADS][D_HEAD][D_MODEL], v_W_Q[N_LAYERS][N_HEADS][D_HEAD][D_MODEL];
 float m_W_K[N_LAYERS][N_HEADS][D_HEAD][D_MODEL], v_W_K[N_LAYERS][N_HEADS][D_HEAD][D_MODEL];
@@ -120,9 +158,15 @@ float m_ln_final_scale[D_MODEL], v_ln_final_scale[D_MODEL];
 float m_ln_final_bias [D_MODEL], v_ln_final_bias [D_MODEL];
 float m_W_unembed[MAX_VOCAB][D_MODEL], v_W_unembed[MAX_VOCAB][D_MODEL];
 float m_pos_embedding[Context_LEN][D_MODEL], v_pos_embedding[Context_LEN][D_MODEL];
+
+// ----------------------------------------------------------------------------
+// AdamW Optimization Step
+// ----------------------------------------------------------------------------
+// Computes decoupled weight decay, updates 1st (m) & 2nd (v) moments with bias
+// correction, and updates weight array w.
 void adamw_step(float lr, int t_step, float beta1 = 0.9f, float beta2 = 0.999f, float eps = 1e-8f, float weight_decay = 0.01f)
 {
-    // Bias correction factors
+    // Bias correction factors to compensate for initial zero values in m and v
     float bias_correction1 = 1.0f - powf(beta1, t_step + 1);
     float bias_correction2 = 1.0f - powf(beta2, t_step + 1);
 
@@ -162,13 +206,19 @@ void adamw_step(float lr, int t_step, float beta1 = 0.9f, float beta2 = 0.999f, 
 
     #undef ADAMW_UPDATE
 }
+
 std::mt19937 rng(42);
 
-// GeLU activation function and its derivative
+// ============================================================================
+// ACTIVATION FUNCTIONS (GeLU - Gaussian Error Linear Unit)
+// ============================================================================
+// GeLU provides non-linearity: gelu(x) = x * Phi(x)
+// Used in GPT models instead of ReLU as it provides smoother gradients around 0.
 inline float gelu(float x) {
     return 0.5f * x * (1.0f + tanhf(0.7978845608f * (x + 0.044715f * x * x)));
 }
 
+// Exact derivative of the GeLU approximation for backpropagation.
 inline float gelu_grad(float x) {
     const float kAlpha = 0.7978845608f;
     const float kBeta  = 0.044715f;
@@ -184,8 +234,10 @@ inline float gelu_grad(float x) {
     return left + right;
 }
 
-
-// Learning rate schedule with warmup and cosine decay
+// ----------------------------------------------------------------------------
+// Learning Rate Schedule
+// ----------------------------------------------------------------------------
+// Combines linear warmup for stability at start with cosine decay for convergence.
 float get_lr(int step, int total_steps) {
     if (step < WARMUP_STEPS) {
         return MAX_LR * ((float)step / WARMUP_STEPS);
@@ -194,6 +246,11 @@ float get_lr(int step, int total_steps) {
     return MIN_LR + 0.5f * (MAX_LR - MIN_LR) * (1.0f + cosf(progress * 3.14159265f));
 }
 
+// ----------------------------------------------------------------------------
+// Parameter Initialization
+// ----------------------------------------------------------------------------
+// Initializes embeddings and weight projections with uniform random values.
+// Scale/Gain parameters for LayerNorm are initialized to 1.0, biases to 0.0.
 void initialize_weights()
 {
     std::uniform_real_distribution<float> dis(-0.1f, 0.1f);
@@ -226,6 +283,12 @@ void initialize_weights()
     printf("Dynamic model weights initialized (Vocab Size = %d, D_MODEL = %d).\n", VOCAB, D_MODEL);
 }
 
+// ============================================================================
+// LAYER NORMALIZATION (LayerNorm)
+// ============================================================================
+// Standardizes feature activations across D_MODEL per token position:
+// xhat = (x - mean) / sqrt(var + eps)
+// out  = xhat * scale + bias
 void layer_norm_forward(const float* x, const float* scale, const float* bias,
                         float* out, float* xhat, float* inv_std_out)
 {
@@ -249,6 +312,7 @@ void layer_norm_forward(const float* x, const float* scale, const float* bias,
     }
 }
 
+// Backward pass for LayerNorm: calculates gradients w.r.t input (dx) and scale/bias parameters.
 void layer_norm_backward(const float* dy, const float* xhat, float inv_std,
                          const float* scale, float* dx,
                          float* d_scale, float* d_bias)
@@ -272,6 +336,7 @@ void layer_norm_backward(const float* dy, const float* xhat, float inv_std,
         dx[i] = inv_std * (d_xhat[i] - mean_dxhat - xhat[i] * mean_dxhat_xhat);
 }
 
+// Reset gradient arrays before calculating backpropagation for a batch.
 void zero_gradients()
 {
     memset(g_token_embedding, 0, sizeof(g_token_embedding));
@@ -291,21 +356,34 @@ void zero_gradients()
     memset(g_W_unembed, 0, sizeof(g_W_unembed));
 }
 
+// ============================================================================
+// FORWARD PASS
+// ============================================================================
+// Executes full forward pass:
+// 1. Embedding lookup (Token + Positional embeddings).
+// 2. Transformer layers (Pre-LN -> Multi-Head Causal Self-Attention -> Residual -> Pre-LN -> MLP -> Residual).
+// 3. Final LayerNorm & Unembedding projection to compute vocabulary logits.
+// 4. Categorical Cross-Entropy Loss over sequence.
 float forward_pass(int* tokens, int* targets, int seq_len)
 {
+    // STEP 1: EMBEDDINGS (Token Embedding + Learned Positional Embedding)
     for (int pos = 0; pos < seq_len; pos++)
         for (int d = 0; d < D_MODEL; d++)
             residual[pos][d] = token_embedding[tokens[pos]][d] + pos_embedding[pos][d];
 
+    // Scaling factor 1 / sqrt(d_k) for Scaled Dot-Product Attention
     float scale = 1.0f / sqrtf((float)D_HEAD);
 
+    // STEP 2: TRANSFORMER BLOCK STACK
     for (int layer = 0; layer < N_LAYERS; layer++)
     {
+        // 2a. Pre-Layer Normalization for Attention Block
         for (int pos = 0; pos < seq_len; pos++)
             layer_norm_forward(residual[pos], ln_attn_scale[layer], ln_attn_bias[layer],
                              s_normed_attn[layer][pos], s_xhat_attn[layer][pos], &s_inv_std_attn[layer][pos]);
 
-        // Optimized QKV projections
+        // 2b. Compute Query, Key, and Value Projections across all Attention Heads
+        //     Q = Normed * W_Q, K = Normed * W_K, V = Normed * W_V
         for (int h = 0; h < N_HEADS; h++) {
             int offset = h * D_HEAD;
             for (int pos = 0; pos < seq_len; pos++) {
@@ -328,11 +406,13 @@ float forward_pass(int* tokens, int* targets, int seq_len)
             for (int d = 0; d < D_MODEL; d++)
                 s_attn_out[layer][pos][d] = 0.0f;
 
-        // Optimized Attention Scoring with pre-allocated reduction
+        // 2c. Scaled Dot-Product Causal Self-Attention
+        //     Attention(Q,K,V) = softmax( (Q * K^T) / sqrt(d_k) + CausalMask ) * V
         for (int h = 0; h < N_HEADS; h++) {
             int offset = h * D_HEAD;
             for (int i = 0; i < seq_len; i++) {
                 float max_val = -1e30f;
+                // Causal Mask: Query position 'i' can only look at Key positions 'j' <= 'i'
                 for (int j = 0; j <= i; j++) {
                     float dot = 0.0f;
                     const float* q_ptr = s_q[layer][h][i];
@@ -343,9 +423,11 @@ float forward_pass(int* tokens, int* targets, int seq_len)
                     s_attn_w[layer][h][i][j] = val;
                     if (val > max_val) max_val = val;
                 }
+                // Mask out future positions (j > i) with negative infinity
                 for (int j = i + 1; j < seq_len; j++)
                     s_attn_w[layer][h][i][j] = -1e30f;
 
+                // Softmax normalization over row i
                 float sum = 0.0f;
                 for (int j = 0; j <= i; j++) {
                     float ev = expf(s_attn_w[layer][h][i][j] - max_val);
@@ -357,6 +439,7 @@ float forward_pass(int* tokens, int* targets, int seq_len)
                     s_attn_w[layer][h][i][j] *= inv_sum;
                 }
 
+                // Weighted sum over Value vectors
                 for (int j = 0; j <= i; j++) {
                     float weight = s_attn_w[layer][h][i][j];
                     const float* v_ptr = s_v[layer][h][j];
@@ -367,7 +450,8 @@ float forward_pass(int* tokens, int* targets, int seq_len)
             }
         }
 
-        // Output projection and residual add
+        // 2d. Output Projection & Residual Connection (Attn Sub-layer)
+        //     residual = residual + W_O * attn_out
         for (int pos = 0; pos < seq_len; pos++) {
             for (int d = 0; d < D_MODEL; d++) {
                 float val = 0.0f;
@@ -379,11 +463,15 @@ float forward_pass(int* tokens, int* targets, int seq_len)
             }
         }
 
+        // 2e. Pre-Layer Normalization for MLP Block
         for (int pos = 0; pos < seq_len; pos++)
             layer_norm_forward(residual[pos], ln_mlp_scale[layer], ln_mlp_bias[layer],
                              s_normed_mlp[layer][pos], s_xhat_mlp[layer][pos], &s_inv_std_mlp[layer][pos]);
 
+        // 2f. Feed-Forward Network (MLP) & Residual Connection
+        //     MLP(x) = W_mlp2 * GeLU(W_mlp1 * x)
         for (int pos = 0; pos < seq_len; pos++) {
+            // Expansion layer: D_MODEL -> D_MLP
             for (int m = 0; m < D_MLP; m++) {
                 float val = 0.0f;
                 const float* norm_ptr = s_normed_mlp[layer][pos];
@@ -392,6 +480,7 @@ float forward_pass(int* tokens, int* targets, int seq_len)
                     val += w_mlp1_ptr[d] * norm_ptr[d];
                 s_mlp_pre_relu[layer][pos][m] = val; 
             }
+            // Non-linear activation (GeLU) + Contraction layer (D_MLP -> D_MODEL) + Residual Add
             for (int d = 0; d < D_MODEL; d++) {
                 float val = 0.0f;
                 const float* w_mlp2_ptr = W_mlp2[layer][d];
@@ -406,6 +495,7 @@ float forward_pass(int* tokens, int* targets, int seq_len)
         }
     }
 
+    // STEP 3: FINAL LAYERNORM & UNEMBEDDING HEAD (LOGITS)
     for (int pos = 0; pos < seq_len; pos++) {
         layer_norm_forward(residual[pos], ln_final_scale, ln_final_bias,
                          s_normed_final[pos], s_xhat_final[pos], &s_inv_std_final[pos]);
@@ -420,6 +510,8 @@ float forward_pass(int* tokens, int* targets, int seq_len)
         }
     }
 
+    // STEP 4: CATEGORICAL CROSS-ENTROPY LOSS COMPUTATION
+    // Loss = -log( softmax(logits)[target_token] )
     float loss = 0.0f;
     for (int pos = 0; pos < seq_len; pos++) {
         float max_val = logits[pos][0];
@@ -432,10 +524,17 @@ float forward_pass(int* tokens, int* targets, int seq_len)
     return loss / seq_len;
 }
 
+// ============================================================================
+// BACKWARD PASS (Backpropagation Through Time / Reverse Computational Graph)
+// ============================================================================
+// Calculates exact parameter gradients using chain rule from Loss -> Logits ->
+// Unembed -> Final LayerNorm -> Layers (MLP -> Attn) -> Embeddings.
 void backward_pass(int* tokens, int* targets, int seq_len)
 {
     float scale = 1.0f / sqrtf((float)D_HEAD);
 
+    // STEP 1: SOFTMAX & CROSS-ENTROPY LOSS GRADIENTS w.r.t LOGITS
+    // dL/d(logit_v) = p_v - y_v
     for (int pos = 0; pos < seq_len; pos++) {
         float max_val = logits[pos][0];
         for (int v = 1; v < VOCAB; v++)
@@ -452,6 +551,7 @@ void backward_pass(int* tokens, int* targets, int seq_len)
         }
     }
 
+    // STEP 2: UNEMBEDDING HEAD BACKWARD PASS
     float d_normed_final[Context_LEN][D_MODEL];
     memset(d_normed_final, 0, sizeof(d_normed_final));
     for (int pos = 0; pos < seq_len; pos++)
@@ -462,14 +562,18 @@ void backward_pass(int* tokens, int* targets, int seq_len)
             }
         }
 
+    // STEP 3: FINAL LAYERNORM BACKWARD PASS
     memset(d_residual, 0, sizeof(d_residual));
     for (int pos = 0; pos < seq_len; pos++)
         layer_norm_backward(d_normed_final[pos], s_xhat_final[pos], s_inv_std_final[pos],
                           ln_final_scale, d_residual[pos], g_ln_final_scale, g_ln_final_bias);
 
+    // STEP 4: TRANSFORMER LAYERS BACKWARD (Reverse Order: N_LAYERS-1 down to 0)
     for (int layer = N_LAYERS - 1; layer >= 0; layer--)
     {
+        // 4a. MLP Sub-layer Backward
         for (int pos = 0; pos < seq_len; pos++) {
+            // Gradient through W_mlp2
             float d_gelu_out[D_MLP];
             for (int m = 0; m < D_MLP; m++) {
                 float val = 0.0f;
@@ -484,10 +588,12 @@ void backward_pass(int* tokens, int* targets, int seq_len)
                     g_W_mlp2[layer][d][m] += d_residual[pos][d] * gelu_val;
                 }
 
+            // Gradient through GeLU non-linearity
             float d_pre_gelu[D_MLP];
             for (int m = 0; m < D_MLP; m++)
                 d_pre_gelu[m] = d_gelu_out[m] * gelu_grad(s_mlp_pre_relu[layer][pos][m]);
 
+            // Gradient through W_mlp1
             float d_normed_mlp_pos[D_MODEL];
             for (int d = 0; d < D_MODEL; d++) {
                 float val = 0.0f;
@@ -500,6 +606,7 @@ void backward_pass(int* tokens, int* targets, int seq_len)
                 for (int d = 0; d < D_MODEL; d++)
                     g_W_mlp1[layer][m][d] += d_pre_gelu[m] * s_normed_mlp[layer][pos][d];
 
+            // Gradient through Pre-MLP LayerNorm
             float d_res_from_mlp_ln[D_MODEL];
             layer_norm_backward(d_normed_mlp_pos, s_xhat_mlp[layer][pos], s_inv_std_mlp[layer][pos],
                               ln_mlp_scale[layer], d_res_from_mlp_ln, g_ln_mlp_scale[layer], g_ln_mlp_bias[layer]);
@@ -507,6 +614,7 @@ void backward_pass(int* tokens, int* targets, int seq_len)
             for (int d = 0; d < D_MODEL; d++) d_residual[pos][d] += d_res_from_mlp_ln[d];
         }
 
+        // 4b. Multi-Head Attention Output Projection (W_O) Backward
         memset(d_attn_out_buf, 0, sizeof(d_attn_out_buf));
         for (int pos = 0; pos < seq_len; pos++) {
             for (int d2 = 0; d2 < D_MODEL; d2++) {
@@ -524,6 +632,7 @@ void backward_pass(int* tokens, int* targets, int seq_len)
         memset(d_k, 0, sizeof(d_k));
         memset(d_v, 0, sizeof(d_v));
 
+        // 4c. Attention Weights & Softmax Backward
         for (int h = 0; h < N_HEADS; h++) {
             int offset = h * D_HEAD;
             for (int i = 0; i < seq_len; i++) {
@@ -539,10 +648,12 @@ void backward_pass(int* tokens, int* targets, int seq_len)
                 for (int j = 0; j <= i; j++)
                     dot += d_attn_w[j] * s_attn_w[layer][h][i][j];
 
+                // Backward pass through Softmax
                 float d_score[Context_LEN];
                 for (int j = 0; j <= i; j++)
                     d_score[j] = s_attn_w[layer][h][i][j] * (d_attn_w[j] - dot);
 
+                // Gradients for Queries (Q) and Keys (K)
                 for (int j = 0; j <= i; j++)
                     for (int dh = 0; dh < D_HEAD; dh++) {
                         d_q[h][i][dh] += d_score[j] * scale * s_k[layer][h][j][dh];
@@ -551,6 +662,7 @@ void backward_pass(int* tokens, int* targets, int seq_len)
             }
         }
 
+        // 4d. Linear Projections (W_Q, W_K, W_V) Backward
         memset(d_normed_buf, 0, sizeof(d_normed_buf));
         for (int h = 0; h < N_HEADS; h++)
             for (int pos = 0; pos < seq_len; pos++)
@@ -564,6 +676,7 @@ void backward_pass(int* tokens, int* targets, int seq_len)
                         g_W_V[layer][h][dh][d] += d_v[h][pos][dh] * s_normed_attn[layer][pos][d];
                     }
 
+        // 4e. Pre-Attention LayerNorm Backward
         for (int pos = 0; pos < seq_len; pos++) {
             float d_res_from_attn_ln[D_MODEL];
             layer_norm_backward(d_normed_buf[pos], s_xhat_attn[layer][pos], s_inv_std_attn[layer][pos],
@@ -572,6 +685,7 @@ void backward_pass(int* tokens, int* targets, int seq_len)
         }
     }
 
+    // STEP 5: EMBEDDINGS BACKWARD (Token & Positional Embeddings)
     for (int pos = 0; pos < seq_len; pos++)
         for (int d = 0; d < D_MODEL; d++)
         {
@@ -580,6 +694,7 @@ void backward_pass(int* tokens, int* targets, int seq_len)
         }
 }
 
+// Simple Stochastic Gradient Descent (SGD) step alternative.
 void sgd_step(float lr)
 {
     #define UPDATE(w, gw, size) \
@@ -604,6 +719,10 @@ void sgd_step(float lr)
     #undef UPDATE
 }
 
+// ----------------------------------------------------------------------------
+// Tokenization & Parsing Helper
+// ----------------------------------------------------------------------------
+// Converts a raw text prompt into a vector of token IDs based on vocabulary map.
 std::vector<int> prompt_to_vector(const std::string& prompt_str, const std::map<std::string, int>& word_to_id)
 {
     std::vector<int> prompt_ids;
@@ -637,6 +756,7 @@ std::vector<int> prompt_to_vector(const std::string& prompt_str, const std::map<
     return prompt_ids;
 }
 
+// Save trained model binary weights to disk.
 void save_model(const std::string& filename)
 {
     std::ofstream file(filename, std::ios::binary);
@@ -665,6 +785,7 @@ void save_model(const std::string& filename)
     printf("Model successfully saved to binary file '%s'.\n", filename.c_str());
 }
 
+// Load trained model binary weights from disk.
 void load_model(const std::string& filename)
 {
     std::ifstream file(filename, std::ios::binary);
@@ -693,6 +814,14 @@ void load_model(const std::string& filename)
     printf("Model successfully loaded from binary file '%s'.\n", filename.c_str());
 }
 
+// ============================================================================
+// INFERENCE & AUTOREGRESSIVE SAMPLING
+// ============================================================================
+// Generates text autoregressively (token by token) given a prompt.
+// Incorporates 3 sampling techniques:
+// 1. Repetition Penalty: Reduces probability of recently generated tokens.
+// 2. Temperature Scaling: Controls randomness (lower = deterministic, higher = creative).
+// 3. Top-K Sampling: Restricts sampling to the top-K most likely candidates.
 void generate_words(const int* prompt_ids, int prompt_len, int max_new_tokens)
 {
     std::vector<int> current_tokens;
@@ -793,6 +922,7 @@ void generate_words(const int* prompt_ids, int prompt_len, int max_new_tokens)
     printf("\n------------------------\n");
 }
 
+// Generate vocabulary diagnostic report file.
 void save_token_report(
     const std::string& model_file,
     const std::vector<std::pair<std::string, int>>& sorted_vocab,
@@ -827,6 +957,12 @@ void save_token_report(
     printf("Token report saved to '%s'\n", report_file.c_str());
 }
 
+// ============================================================================
+// TOKENIZATION & CORPUS PARSING
+// ============================================================================
+// Simple word-level + punctuation tokenizer:
+// Reads raw text file, separates words and punctuation marks into vocabulary IDs,
+// and maps training corpus into sequence of integer token IDs.
 bool load_and_tokenize_corpus(const std::string& filename, std::vector<int>& training_word_ids, std::map<std::string, int>& word_to_id)
 {
     std::string corpus = "";
@@ -934,6 +1070,7 @@ bool load_and_tokenize_corpus(const std::string& filename, std::vector<int>& tra
     return true;
 }
 
+// Wrapper for text generation inference.
 void inference(const std::string& prompt, 
                const std::map<std::string,int>& word_to_id)
 {
@@ -941,6 +1078,14 @@ void inference(const std::string& prompt,
     generate_words(prompt_ids.data(), prompt_ids.size(), MAX_NEW_TOKENS);
 }
 
+// ============================================================================
+// MODEL TRAINING LOOP
+// ============================================================================
+// Standard language model training loop:
+// 1. Randomly sample sequence windows from text token buffer.
+// 2. Perform forward pass (predict next token at each position).
+// 3. Compute loss & gradients via backward pass.
+// 4. Update model parameters with AdamW optimizer.
 void train(const std::vector<int>& training_word_ids)
 {
     int tokens[Context_LEN];
@@ -950,10 +1095,11 @@ void train(const std::vector<int>& training_word_ids)
 
         zero_gradients();
 
+        // Sample random sequence segment of length Context_LEN
         int start = rng() % (training_word_ids.size() - Context_LEN);
         for (int i = 0; i < Context_LEN; i++) {
             tokens[i]  = training_word_ids[start + i];
-            targets[i] = training_word_ids[start + i + 1];
+            targets[i] = training_word_ids[start + i + 1]; // Target is next token (shifted by 1)
         }
 
         float lr = get_lr(step, N_STEPS);
@@ -968,6 +1114,9 @@ void train(const std::vector<int>& training_word_ids)
     save_model(MODEL_FILE);
 }
 
+// ============================================================================
+// MAIN ENTRY POINT
+// ============================================================================
 int main(int argc, char** argv)
 {
     // Fallback to default prompt if no argument is supplied
