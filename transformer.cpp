@@ -25,8 +25,8 @@
 
 // Model Architecture
 const int   MAX_VOCAB      = 4900;
-const int   Context_LEN    = 64;      
-const int   N_LAYERS       = 4;
+const int   Context_LEN    = 256;      
+const int   N_LAYERS       = 6;
 const int   D_MODEL        = 128;      
 const int   N_HEADS        = 4;
 const int   D_HEAD         = D_MODEL / N_HEADS;   
@@ -979,41 +979,99 @@ bool load_and_tokenize_corpus(const std::string& filename, std::vector<int>& tra
         corpus = "I walk down a wide road... <|endoftext|> Once upon a time...";
     }
 
-    std::stringstream ss(corpus);
-    std::string raw_token;
     std::vector<std::string> all_parsed_tokens;
     std::map<std::string, int> token_counts;
+    std::string current_word = "";
 
-    while (ss >> raw_token) {
-        if (raw_token == "<|endoftext|>") {
+    // Parse corpus character-by-character directly to avoid std::stringstream string-gluing bugs 
+    // and multi-byte UTF-8 fragmentation, leaving your raw file 100% untouched.
+    for (size_t i = 0; i < corpus.size(); ) {
+        unsigned char c = corpus[i];
+
+        // Check for <|endoftext|> tag
+        if (corpus.compare(i, 13, "<|endoftext|>") == 0) {
+            if (!current_word.empty()) {
+                all_parsed_tokens.push_back(current_word);
+                token_counts[current_word]++;
+                current_word = "";
+            }
             all_parsed_tokens.push_back("<|endoftext|>");
             token_counts["<|endoftext|>"]++;
+            i += 13;
             continue;
         }
 
-        std::string current_word = "";
-        for (size_t i = 0; i < raw_token.size(); i++) {
-            char c = raw_token[i];
-
-            // Separate punctuation marks into standalone tokens
-            if (ispunct(c) && c != '\'' && c != '-') { 
-                if (!current_word.empty()) {
-                    all_parsed_tokens.push_back(current_word);
-                    token_counts[current_word]++;
-                    current_word = "";
-                }
-                // Add punctuation as its own individual token
-                std::string punct_token(1, c);
-                all_parsed_tokens.push_back(punct_token);
-                token_counts[punct_token]++;
-            } else {
-                current_word += tolower(c);
+        // Whitespace acts as a token boundary
+        if (isspace(c)) {
+            if (!current_word.empty()) {
+                all_parsed_tokens.push_back(current_word);
+                token_counts[current_word]++;
+                current_word = "";
             }
+            i++;
+            continue;
         }
-        if (!current_word.empty()) {
-            all_parsed_tokens.push_back(current_word);
-            token_counts[current_word]++;
+
+        // Handle multi-byte UTF-8 smart quotes (“ ” ‘ ’) and normalize them cleanly to standard quotes
+        if (i + 2 < corpus.size() && 
+            (unsigned char)corpus[i] == 0xE2 && 
+            (unsigned char)corpus[i+1] == 0x80 && 
+            ((unsigned char)corpus[i+2] == 0x9C || (unsigned char)corpus[i+2] == 0x9D || 
+             (unsigned char)corpus[i+2] == 0x98 || (unsigned char)corpus[i+2] == 0x99)) {
+            
+            if (!current_word.empty()) {
+                all_parsed_tokens.push_back(current_word);
+                token_counts[current_word]++;
+                current_word = "";
+            }
+
+            std::string quote_char = "\"";
+            unsigned char q3 = corpus[i+2];
+            if (q3 == 0x98 || q3 == 0x99) quote_char = "'";
+
+            all_parsed_tokens.push_back(quote_char);
+            token_counts[quote_char]++;
+            i += 3;
+            continue;
         }
+
+        // Standard ASCII punctuation gets isolated as a standalone token
+        if (c < 128 && ispunct(c) && c != '\'' && c != '-') {
+            if (!current_word.empty()) {
+                all_parsed_tokens.push_back(current_word);
+                token_counts[current_word]++;
+                current_word = "";
+            }
+            std::string punct_token(1, c);
+            all_parsed_tokens.push_back(punct_token);
+            token_counts[punct_token]++;
+            i++;
+            continue;
+        }
+
+        // Accumulate regular words / characters safely
+        if (c >= 128) {
+            size_t char_len = 1;
+            if ((c & 0xE0) == 0xC0) char_len = 2;
+            else if ((c & 0xF0) == 0xE0) char_len = 3;
+            else if ((c & 0xF8) == 0xF0) char_len = 4;
+
+            if (i + char_len <= corpus.size()) {
+                current_word += corpus.substr(i, char_len);
+                i += char_len;
+            } else {
+                current_word += c;
+                i++;
+            }
+        } else {
+            current_word += tolower(c);
+            i++;
+        }
+    }
+
+    if (!current_word.empty()) {
+        all_parsed_tokens.push_back(current_word);
+        token_counts[current_word]++;
     }
 
     // Sort vocabulary by frequency

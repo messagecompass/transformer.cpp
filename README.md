@@ -20,5 +20,4 @@ A complete GPT-style Transformer implemented from scratch in one file with zero 
 ```bash
 git clone https://github.com/messagecompass/transformer.cpp.git
 cd transformer.cpp
-g++ -O3 -march=native -ffast-math transformer.cpp -o transformer
-./transformer "once upon a time"
+g++ -O3 -march=native -ffast-math transformer.cpp -o transformer & ./transformer "once upon a time"
