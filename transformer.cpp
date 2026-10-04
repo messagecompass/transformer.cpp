@@ -41,9 +41,7 @@ const float EARLY_STOP_LOSS = 2.5f;
 
 // Generation & File Settings
 const int   MAX_NEW_TOKENS = 100;
-const char* TRAINING_FILE  = "TinyStories-valid.txt";//"aesop_fables.txt";//
-const char* MODEL_FILE     = "tinystories_model.bin";//"aesop_fables.bin"; //
-
+std::string modelFile;
 // ============================================================================
 // MODEL PARAMETERS & GRADIENT BUFFERS
 // ============================================================================
@@ -756,7 +754,7 @@ std::vector<int> prompt_to_vector(const std::string& prompt_str, const std::map<
 }
 
 // Save trained model binary weights to disk.
-void save_model(const std::string& filename)
+void saveModel(const std::string& filename)
 {
     std::ofstream file(filename, std::ios::binary);
     if (!file.is_open()) {
@@ -785,7 +783,7 @@ void save_model(const std::string& filename)
 }
 
 // Load trained model binary weights from disk.
-void load_model(const std::string& filename)
+void loadModel(const std::string& filename)
 {
     std::ifstream file(filename, std::ios::binary);
     if (!file.is_open()) {
@@ -1123,7 +1121,7 @@ bool load_and_tokenize_corpus(const std::string& filename, std::vector<int>& tra
     }
 
     printf("Frequency-based Tokenization Complete. Unique Vocabulary Size: %d words/symbols (Max allowed: %d).\n", VOCAB, MAX_VOCAB);
-    save_token_report(MODEL_FILE, sorted_vocab, word_to_id);
+    save_token_report(modelFile, sorted_vocab, word_to_id);
     return true;
 }
 
@@ -1181,7 +1179,7 @@ void train(const std::vector<int>& training_word_ids)
 
      }
 
-    save_model(MODEL_FILE);
+    saveModel(modelFile);
 }
 
 // ============================================================================
@@ -1189,20 +1187,21 @@ void train(const std::vector<int>& training_word_ids)
 // ============================================================================
 int main(int argc, char** argv)
 {
-    // Fallback to default prompt if no argument is supplied
-    std::string prompt = (argc > 1) ? argv[1] : "A Frog and a";
+    std::string trainingFile = (argc > 1) ? argv[1] : "TinyStories-valid.txt";
+    std::string prompt        = (argc > 2) ? argv[2] : "A Frog and a";
+    modelFile = trainingFile + ".bin";
 
     std::map<std::string,int> word_to_id;
     std::vector<int> training_word_ids;
 
-    load_and_tokenize_corpus(TRAINING_FILE, training_word_ids, word_to_id);
+    load_and_tokenize_corpus(trainingFile, training_word_ids, word_to_id);
     initialize_weights();
 
-    std::ifstream check_file(MODEL_FILE, std::ios::binary);
-    bool model_exists = check_file.is_open();
-    if (model_exists) {
+    std::ifstream check_file(modelFile, std::ios::binary);
+    bool modelExists = check_file.is_open();
+    if (modelExists) {
         check_file.close();
-        load_model(MODEL_FILE);
+        loadModel(modelFile);
     } else {
         train(training_word_ids);
     }
