@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <map>
 #include <fstream>
+#include <ctime>
 
 // ============================================================================
 // HYPERPARAMETERS & CONFIGURATION (Modify these easily to experiment!)
@@ -24,7 +25,7 @@
 
 // Model Architecture
 const int   MAX_VOCAB      = 4900;
-const int   Context_LEN    = 128;      
+const int   Context_LEN    = 64;      
 const int   N_LAYERS       = 4;
 const int   D_MODEL        = 128;      
 const int   N_HEADS        = 4;
@@ -32,11 +33,11 @@ const int   D_HEAD         = D_MODEL / N_HEADS;
 const int   D_MLP          = D_MODEL * 4;          
 
 // Training Settings
-const int   N_STEPS        = 12000;
+const int   N_STEPS        = 20000;
 const int   WARMUP_STEPS   = 1000;
 const float MAX_LR         = 0.001f;
 const float MIN_LR         = 0.0001f;
-const float EARLY_STOP_LOSS = 2.0f;
+const float EARLY_STOP_LOSS = 2.5f;
 
 // Generation & File Settings
 const int   MAX_NEW_TOKENS = 100;
@@ -207,8 +208,6 @@ void adamw_step(float lr, int t_step, float beta1 = 0.9f, float beta2 = 0.999f, 
     #undef ADAMW_UPDATE
 }
 
-std::mt19937 rng(42);
-
 // ============================================================================
 // ACTIVATION FUNCTIONS (GeLU - Gaussian Error Linear Unit)
 // ============================================================================
@@ -245,7 +244,7 @@ float get_lr(int step, int total_steps) {
     float progress = (float)(step - WARMUP_STEPS) / (total_steps - WARMUP_STEPS);
     return MIN_LR + 0.5f * (MAX_LR - MIN_LR) * (1.0f + cosf(progress * 3.14159265f));
 }
-
+    std::mt19937 rng(42);
 // ----------------------------------------------------------------------------
 // Parameter Initialization
 // ----------------------------------------------------------------------------
@@ -1088,11 +1087,12 @@ void inference(const std::string& prompt,
 // 4. Update model parameters with AdamW optimizer.
 void train(const std::vector<int>& training_word_ids)
 {
+    
     int tokens[Context_LEN];
     int targets[Context_LEN];
-
+    
     for (int step = 0; step < N_STEPS; step++) {
-
+        clock_t start_time = clock();
         zero_gradients();
 
         // Sample random sequence segment of length Context_LEN
@@ -1107,9 +1107,21 @@ void train(const std::vector<int>& training_word_ids)
         backward_pass(tokens, targets, Context_LEN);
         adamw_step(lr, step);     //sgd_step(lr);
 
-        if (step % 4000 == 0)
+        clock_t end_time = clock(); // End timer
+        float elapsed_ms = (float)(end_time - start_time) * 1000.0f / CLOCKS_PER_SEC;
+
+        // Print every step and flush stdout immediately so it won't look frozen
+        printf("step %d loss %.4f [%.2f ms]\n", step, loss, elapsed_ms);
+
+        if (step % 400 == 0)
             printf("step %d loss %.4f\n", step, loss);
-    }
+        
+        if (loss <= EARLY_STOP_LOSS) {
+            printf("Early stopping triggered: Loss %.4f reached target threshold (<= %.1f)\n", loss, EARLY_STOP_LOSS);
+            break;
+        }
+
+     }
 
     save_model(MODEL_FILE);
 }

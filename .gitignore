@@ -7,3 +7,4 @@ aesop_fables.bin_tokens.txt
 .gitignore
 aesop_fables.bin
 tinystories_model.bin_tokens.txt
+transformer
