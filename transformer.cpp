@@ -5,7 +5,6 @@
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
-#include <random>
 #include <vector>
 #include <string>
 #include <sstream>
@@ -18,7 +17,7 @@
 // HYPERPARAMETERS & CONFIGURATION
 // ============================================================================
 const int   maximum_vocabulary_size             = 4900;
-const int   context_length_limit                = 256;      
+const int   context_length_limit                = 512;      
 const int   total_transformer_layers            = 6;
 const int   embedding_dimension_size            = 128;      
 const int   attention_head_count                = 4;
@@ -129,7 +128,22 @@ float momentum_final_bias_parameters[embedding_dimension_size], velocity_final_b
 float momentum_unembedding_projection[maximum_vocabulary_size][embedding_dimension_size], velocity_unembedding_projection[maximum_vocabulary_size][embedding_dimension_size];
 float momentum_positional_embedding[context_length_limit][embedding_dimension_size], velocity_positional_embedding[context_length_limit][embedding_dimension_size];
 
-std::mt19937 random_number_generator(42);
+// ============================================================================
+// SELF-CONTAINED LOCAL RANDOM NUMBER GENERATOR
+// ============================================================================
+static inline int next_random(void) {
+    static unsigned int state = 42;
+    state ^= state << 13;
+    state ^= state >> 17;
+    state ^= state << 5;
+    return (int)(state & 0x7FFFFFFF);
+}
+
+static inline float sample_uniform_range(float minimum_value, float maximum_value) {
+    int raw_value = next_random();
+    float normalized_value = (float)raw_value / (float)0x7FFFFFFF;
+    return minimum_value + (maximum_value - minimum_value) * normalized_value;
+}
 
 // ============================================================================
 // OPTIMIZER & ACTIVATION FUNCTIONS
@@ -204,8 +218,11 @@ float calculate_learning_rate_schedule(int current_step, int total_steps) {
 // ============================================================================
 void initialize_model_weights()
 {
-    std::uniform_real_distribution<float> distribution(-0.1f, 0.1f);
-    auto fill_random_values = [&](float* pointer, int size) { for (int index = 0; index < size; index++) pointer[index] = distribution(random_number_generator); };
+    auto fill_random_values = [&](float* pointer, int size) { 
+        for (int index = 0; index < size; index++) {
+            pointer[index] = sample_uniform_range(-0.1f, 0.1f);
+        } 
+    };
     auto fill_constant_values = [&](float* pointer, int size, float value) { for (int index = 0; index < size; index++) pointer[index] = value; };
 
     fill_random_values(&token_embedding_parameters[0][0], current_vocabulary_size * embedding_dimension_size);
@@ -742,8 +759,7 @@ void generate_autoregressive_tokens(const int* prompt_token_ids, int prompt_leng
             top_k_cumulative_sum += probability_pairs[index].first;
         }
 
-        std::uniform_real_distribution<float> uniform_distribution(0.0f, top_k_cumulative_sum);
-        float random_sample_value = uniform_distribution(random_number_generator);
+        float random_sample_value = sample_uniform_range(0.0f, top_k_cumulative_sum);
         float cumulative_probability_accumulator = 0.0f;
         int chosen_token_id = probability_pairs[0].second;
 
@@ -978,7 +994,7 @@ void execute_model_training(const std::vector<int>& training_word_ids)
         clock_t training_start_time = clock();
         reset_all_gradients();
 
-        int random_start_offset = random_number_generator() % (training_word_ids.size() - context_length_limit);
+        int random_start_offset = next_random() % (training_word_ids.size() - context_length_limit);
         for (int index = 0; index < context_length_limit; index++) {
             batch_tokens[index]  = training_word_ids[random_start_offset + index];
             batch_targets[index] = training_word_ids[random_start_offset + index + 1];
