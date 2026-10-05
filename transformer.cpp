@@ -15,903 +15,759 @@
 #include <ctime>
 
 // ============================================================================
-// HYPERPARAMETERS & CONFIGURATION (Modify these easily to experiment!)
+// HYPERPARAMETERS & CONFIGURATION
 // ============================================================================
-// Transformer Architecture Specifications:
-// - Context Length (T): Maximum sequence length the model can process at once.
-// - Embedding Dimension (D_MODEL): Dimension of token & positional embeddings.
-// - Multi-Head Attention: Splits D_MODEL into N_HEADS of size D_HEAD (D_MODEL = N_HEADS * D_HEAD).
-// - Feed-Forward Expansion (D_MLP): Standard GPT convention expands D_MODEL by 4x in the MLP block.
+const int   maximum_vocabulary_size             = 4900;
+const int   context_length_limit                = 256;      
+const int   total_transformer_layers            = 6;
+const int   embedding_dimension_size            = 128;      
+const int   attention_head_count                = 4;
+const int   attention_head_dimension            = embedding_dimension_size / attention_head_count;   
+const int   feed_forward_hidden_dimension_size  = embedding_dimension_size * 4;          
 
-// Model Architecture
-const int   MAX_VOCAB      = 4900;
-const int   Context_LEN    = 256;      
-const int   N_LAYERS       = 6;
-const int   D_MODEL        = 128;      
-const int   N_HEADS        = 4;
-const int   D_HEAD         = D_MODEL / N_HEADS;   
-const int   D_MLP          = D_MODEL * 4;          
+const int   total_training_steps                = 20000;
+const int   learning_rate_warmup_steps          = 1000;
+const float maximum_learning_rate               = 0.001f;
+const float minimum_learning_rate               = 0.0001f;
+const float early_stopping_loss_threshold       = 2.5f;
 
-// Training Settings
-const int   N_STEPS        = 20000;
-const int   WARMUP_STEPS   = 1000;
-const float MAX_LR         = 0.001f;
-const float MIN_LR         = 0.0001f;
-const float EARLY_STOP_LOSS = 2.5f;
+const int   maximum_new_tokens_to_generate      = 100;
+std::string model_file_path;
 
-// Generation & File Settings
-const int   MAX_NEW_TOKENS = 100;
-std::string modelFile;
 // ============================================================================
 // MODEL PARAMETERS & GRADIENT BUFFERS
 // ============================================================================
 
-int VOCAB = 0;
-char VOCAB_WORDS[MAX_VOCAB][32];
+int current_vocabulary_size = 0;
+char vocabulary_word_strings[maximum_vocabulary_size][32];
 
-// ----------------------------------------------------------------------------
-// Model Weights (Parameters)
-// ----------------------------------------------------------------------------
-// 1. Token Embeddings: Maps discrete token IDs to continuous vectors of size D_MODEL.
-float token_embedding[MAX_VOCAB][D_MODEL];
+// 1. Token & Positional Embeddings
+float token_embedding_parameters[maximum_vocabulary_size][embedding_dimension_size];
+float positional_embedding_parameters[context_length_limit][embedding_dimension_size];
 
-// 2. Multi-Head Attention Weights (per layer):
-//    - W_Q, W_K, W_V: Linear projections to construct Query, Key, and Value vectors.
-//    - W_O: Output projection weight to mix information across all attention heads.
-float W_Q[N_LAYERS][N_HEADS][D_HEAD][D_MODEL];
-float W_K[N_LAYERS][N_HEADS][D_HEAD][D_MODEL];
-float W_V[N_LAYERS][N_HEADS][D_HEAD][D_MODEL];
-float W_O[N_LAYERS][D_MODEL][D_MODEL];
+// 2. Attention & Feed-Forward Weights
+float query_projection_weight_matrix[total_transformer_layers][attention_head_count][attention_head_dimension][embedding_dimension_size];
+float key_projection_weight_matrix[total_transformer_layers][attention_head_count][attention_head_dimension][embedding_dimension_size];
+float value_projection_weight_matrix[total_transformer_layers][attention_head_count][attention_head_dimension][embedding_dimension_size];
+float output_projection_weight_matrix[total_transformer_layers][embedding_dimension_size][embedding_dimension_size];
 
-// 3. Feed-Forward / MLP Weights (per layer):
-//    - W_mlp1: Projects D_MODEL -> D_MLP (expansion layer).
-//    - W_mlp2: Projects D_MLP -> D_MODEL (contraction layer).
-float W_mlp1[N_LAYERS][D_MLP][D_MODEL];
-float W_mlp2[N_LAYERS][D_MODEL][D_MLP];
+float feed_forward_expansion_weight_matrix[total_transformer_layers][feed_forward_hidden_dimension_size][embedding_dimension_size];
+float feed_forward_contraction_weight_matrix[total_transformer_layers][embedding_dimension_size][feed_forward_hidden_dimension_size];
 
-// 4. Layer Normalization Parameters (Gain/Scale & Bias):
-//    - Pre-Attention LayerNorm parameters (ln_attn)
-//    - Pre-MLP LayerNorm parameters (ln_mlp)
-//    - Final LayerNorm parameters before logits projection (ln_final)
-float ln_attn_scale[N_LAYERS][D_MODEL];
-float ln_attn_bias [N_LAYERS][D_MODEL];
-float ln_mlp_scale [N_LAYERS][D_MODEL];
-float ln_mlp_bias  [N_LAYERS][D_MODEL];
-float ln_final_scale[D_MODEL];
-float ln_final_bias [D_MODEL];
+// 3. Layer Normalization Parameters
+float attention_layer_normalization_scale_parameters[total_transformer_layers][embedding_dimension_size];
+float attention_layer_normalization_bias_parameters[total_transformer_layers][embedding_dimension_size];
+float feed_forward_layer_normalization_scale_parameters[total_transformer_layers][embedding_dimension_size];
+float feed_forward_layer_normalization_bias_parameters[total_transformer_layers][embedding_dimension_size];
+float final_layer_normalization_scale_parameters[embedding_dimension_size];
+float final_layer_normalization_bias_parameters[embedding_dimension_size];
 
-// 5. Unembedding Head:
-//    - Maps final hidden state D_MODEL back to vocabulary size to produce logits.
-float W_unembed[MAX_VOCAB][D_MODEL];
+// 4. Unembedding Head
+float unembedding_projection_weight_matrix[maximum_vocabulary_size][embedding_dimension_size];
 
-// ----------------------------------------------------------------------------
-// Parameter Gradients (Accumulate gradients computed during backward_pass)
-// ----------------------------------------------------------------------------
-float g_token_embedding[MAX_VOCAB][D_MODEL];
-float g_W_Q[N_LAYERS][N_HEADS][D_HEAD][D_MODEL];
-float g_W_K[N_LAYERS][N_HEADS][D_HEAD][D_MODEL];
-float g_W_V[N_LAYERS][N_HEADS][D_HEAD][D_MODEL];
-float g_W_O[N_LAYERS][D_MODEL][D_MODEL];
-float g_W_mlp1[N_LAYERS][D_MLP][D_MODEL];
-float g_W_mlp2[N_LAYERS][D_MODEL][D_MLP];
-float g_ln_attn_scale[N_LAYERS][D_MODEL];
-float g_ln_attn_bias [N_LAYERS][D_MODEL];
-float g_ln_mlp_scale[N_LAYERS][D_MODEL];
-float g_ln_mlp_bias  [N_LAYERS][D_MODEL];
-float g_ln_final_scale[D_MODEL];
-float g_ln_final_bias  [D_MODEL];
-float g_W_unembed[MAX_VOCAB][D_MODEL];
+// 5. Parameter Gradients
+float token_embedding_gradient_buffer[maximum_vocabulary_size][embedding_dimension_size];
+float positional_embedding_gradient_buffer[context_length_limit][embedding_dimension_size];
+float query_projection_weight_gradient_matrix[total_transformer_layers][attention_head_count][attention_head_dimension][embedding_dimension_size];
+float key_projection_weight_gradient_matrix[total_transformer_layers][attention_head_count][attention_head_dimension][embedding_dimension_size];
+float value_projection_weight_gradient_matrix[total_transformer_layers][attention_head_count][attention_head_dimension][embedding_dimension_size];
+float output_projection_weight_gradient_matrix[total_transformer_layers][embedding_dimension_size][embedding_dimension_size];
+float feed_forward_expansion_weight_gradient_matrix[total_transformer_layers][feed_forward_hidden_dimension_size][embedding_dimension_size];
+float feed_forward_contraction_weight_gradient_matrix[total_transformer_layers][embedding_dimension_size][feed_forward_hidden_dimension_size];
+float attention_layer_normalization_scale_gradient_parameters[total_transformer_layers][embedding_dimension_size];
+float attention_layer_normalization_bias_gradient_parameters[total_transformer_layers][embedding_dimension_size];
+float feed_forward_layer_normalization_scale_gradient_parameters[total_transformer_layers][embedding_dimension_size];
+float feed_forward_layer_normalization_bias_gradient_parameters[total_transformer_layers][embedding_dimension_size];
+float final_layer_normalization_scale_gradient_parameters[embedding_dimension_size];
+float final_layer_normalization_bias_gradient_parameters[embedding_dimension_size];
+float unembedding_projection_weight_gradient_matrix[maximum_vocabulary_size][embedding_dimension_size];
 
-// 6. Learned Positional Embeddings:
-//    - Self-attention is permutation-invariant. Positional embeddings encode order.
-float pos_embedding[Context_LEN][D_MODEL];
-float g_pos_embedding[Context_LEN][D_MODEL];
-
-// ----------------------------------------------------------------------------
-// Intermediate Activation Saved Memory (Saved during Forward for Backward Pass)
-// ----------------------------------------------------------------------------
-float s_xhat_attn[N_LAYERS][Context_LEN][D_MODEL];
-float s_inv_std_attn[N_LAYERS][Context_LEN];
-float s_normed_attn[N_LAYERS][Context_LEN][D_MODEL];
-float s_q[N_LAYERS][N_HEADS][Context_LEN][D_HEAD];
-float s_k[N_LAYERS][N_HEADS][Context_LEN][D_HEAD];
-float s_v[N_LAYERS][N_HEADS][Context_LEN][D_HEAD];
-float s_attn_w[N_LAYERS][N_HEADS][Context_LEN][Context_LEN];
-float s_attn_out[N_LAYERS][Context_LEN][D_MODEL];
-float s_xhat_mlp[N_LAYERS][Context_LEN][D_MODEL];
-float s_inv_std_mlp[N_LAYERS][Context_LEN];
-float s_normed_mlp[N_LAYERS][Context_LEN][D_MODEL];
-float s_mlp_pre_relu[N_LAYERS][Context_LEN][D_MLP];
-float s_xhat_final[Context_LEN][D_MODEL];
-float s_inv_std_final[Context_LEN];
-float s_normed_final[Context_LEN][D_MODEL];
+// 6. Intermediate Saved Activations for Backward Pass
+float saved_attention_normalized_hat[total_transformer_layers][context_length_limit][embedding_dimension_size];
+float saved_attention_inverse_standard_deviation[total_transformer_layers][context_length_limit];
+float saved_attention_normalized_values[total_transformer_layers][context_length_limit][embedding_dimension_size];
+float saved_query_vectors[total_transformer_layers][attention_head_count][context_length_limit][attention_head_dimension];
+float saved_key_vectors[total_transformer_layers][attention_head_count][context_length_limit][attention_head_dimension];
+float saved_value_vectors[total_transformer_layers][attention_head_count][context_length_limit][attention_head_dimension];
+float saved_attention_weights[total_transformer_layers][attention_head_count][context_length_limit][context_length_limit];
+float saved_attention_output[total_transformer_layers][context_length_limit][embedding_dimension_size];
+float saved_feed_forward_normalized_hat[total_transformer_layers][context_length_limit][embedding_dimension_size];
+float saved_feed_forward_inverse_standard_deviation[total_transformer_layers][context_length_limit];
+float saved_feed_forward_normalized_values[total_transformer_layers][context_length_limit][embedding_dimension_size];
+float saved_feed_forward_pre_activation[total_transformer_layers][context_length_limit][feed_forward_hidden_dimension_size];
+float saved_final_normalized_hat[context_length_limit][embedding_dimension_size];
+float saved_final_inverse_standard_deviation[context_length_limit];
+float saved_final_normalized_values[context_length_limit][embedding_dimension_size];
 
 // Residual Stream & Logit Buffers
-float residual[Context_LEN][D_MODEL];
-float logits  [Context_LEN][MAX_VOCAB];
-float d_residual[Context_LEN][D_MODEL];
-float d_logits  [Context_LEN][MAX_VOCAB];
-float d_attn_out_buf[Context_LEN][D_MODEL];
-float d_normed_buf  [Context_LEN][D_MODEL];
-float d_q[N_HEADS][Context_LEN][D_HEAD];
-float d_k[N_HEADS][Context_LEN][D_HEAD];
-float d_v[N_HEADS][Context_LEN][D_HEAD];
+float residual_stream_buffer[context_length_limit][embedding_dimension_size];
+float vocabulary_logits_buffer[context_length_limit][maximum_vocabulary_size];
+float residual_gradient_buffer[context_length_limit][embedding_dimension_size];
+float logits_gradient_buffer[context_length_limit][maximum_vocabulary_size];
+float attention_output_gradient_buffer[context_length_limit][embedding_dimension_size];
+float normalized_buffer[context_length_limit][embedding_dimension_size];
+float query_gradient_buffer[attention_head_count][context_length_limit][attention_head_dimension];
+float key_gradient_buffer[attention_head_count][context_length_limit][attention_head_dimension];
+float value_gradient_buffer[attention_head_count][context_length_limit][attention_head_dimension];
 
 // ============================================================================
-// ADAMW OPTIMIZER BUFFERS (1st and 2nd moments)
+// ADAMW OPTIMIZER MOMENTUM BUFFERS
 // ============================================================================
-// AdamW keeps track of running averages of past gradients (m) and past squared
-// gradients (v) for adaptive per-parameter learning rates with decoupled weight decay.
-float m_token_embedding[MAX_VOCAB][D_MODEL], v_token_embedding[MAX_VOCAB][D_MODEL];
-float m_W_Q[N_LAYERS][N_HEADS][D_HEAD][D_MODEL], v_W_Q[N_LAYERS][N_HEADS][D_HEAD][D_MODEL];
-float m_W_K[N_LAYERS][N_HEADS][D_HEAD][D_MODEL], v_W_K[N_LAYERS][N_HEADS][D_HEAD][D_MODEL];
-float m_W_V[N_LAYERS][N_HEADS][D_HEAD][D_MODEL], v_W_V[N_LAYERS][N_HEADS][D_HEAD][D_MODEL];
-float m_W_O[N_LAYERS][D_MODEL][D_MODEL], v_W_O[N_LAYERS][D_MODEL][D_MODEL];
-float m_W_mlp1[N_LAYERS][D_MLP][D_MODEL], v_W_mlp1[N_LAYERS][D_MLP][D_MODEL];
-float m_W_mlp2[N_LAYERS][D_MODEL][D_MLP], v_W_mlp2[N_LAYERS][D_MODEL][D_MLP];
-float m_ln_attn_scale[N_LAYERS][D_MODEL], v_ln_attn_scale[N_LAYERS][D_MODEL];
-float m_ln_attn_bias [N_LAYERS][D_MODEL], v_ln_attn_bias [N_LAYERS][D_MODEL];
-float m_ln_mlp_scale [N_LAYERS][D_MODEL], v_ln_mlp_scale [N_LAYERS][D_MODEL];
-float m_ln_mlp_bias  [N_LAYERS][D_MODEL], v_ln_mlp_bias  [N_LAYERS][D_MODEL];
-float m_ln_final_scale[D_MODEL], v_ln_final_scale[D_MODEL];
-float m_ln_final_bias [D_MODEL], v_ln_final_bias [D_MODEL];
-float m_W_unembed[MAX_VOCAB][D_MODEL], v_W_unembed[MAX_VOCAB][D_MODEL];
-float m_pos_embedding[Context_LEN][D_MODEL], v_pos_embedding[Context_LEN][D_MODEL];
+float momentum_token_embedding[maximum_vocabulary_size][embedding_dimension_size], velocity_token_embedding[maximum_vocabulary_size][embedding_dimension_size];
+float momentum_query_projection[total_transformer_layers][attention_head_count][attention_head_dimension][embedding_dimension_size], velocity_query_projection[total_transformer_layers][attention_head_count][attention_head_dimension][embedding_dimension_size];
+float momentum_key_projection[total_transformer_layers][attention_head_count][attention_head_dimension][embedding_dimension_size], velocity_key_projection[total_transformer_layers][attention_head_count][attention_head_dimension][embedding_dimension_size];
+float momentum_value_projection[total_transformer_layers][attention_head_count][attention_head_dimension][embedding_dimension_size], velocity_value_projection[total_transformer_layers][attention_head_count][attention_head_dimension][embedding_dimension_size];
+float momentum_output_projection[total_transformer_layers][embedding_dimension_size][embedding_dimension_size], velocity_output_projection[total_transformer_layers][embedding_dimension_size][embedding_dimension_size];
+float momentum_feed_forward_expansion[total_transformer_layers][feed_forward_hidden_dimension_size][embedding_dimension_size], velocity_feed_forward_expansion[total_transformer_layers][feed_forward_hidden_dimension_size][embedding_dimension_size];
+float momentum_feed_forward_contraction[total_transformer_layers][embedding_dimension_size][feed_forward_hidden_dimension_size], velocity_feed_forward_contraction[total_transformer_layers][embedding_dimension_size][feed_forward_hidden_dimension_size];
+float momentum_attention_scale_parameters[total_transformer_layers][embedding_dimension_size], velocity_attention_scale_parameters[total_transformer_layers][embedding_dimension_size];
+float momentum_attention_bias_parameters[total_transformer_layers][embedding_dimension_size], velocity_attention_bias_parameters[total_transformer_layers][embedding_dimension_size];
+float momentum_feed_forward_scale_parameters[total_transformer_layers][embedding_dimension_size], velocity_feed_forward_scale_parameters[total_transformer_layers][embedding_dimension_size];
+float momentum_feed_forward_bias_parameters[total_transformer_layers][embedding_dimension_size], velocity_feed_forward_bias_parameters[total_transformer_layers][embedding_dimension_size];
+float momentum_final_scale_parameters[embedding_dimension_size], velocity_final_scale_parameters[embedding_dimension_size];
+float momentum_final_bias_parameters[embedding_dimension_size], velocity_final_bias_parameters[embedding_dimension_size];
+float momentum_unembedding_projection[maximum_vocabulary_size][embedding_dimension_size], velocity_unembedding_projection[maximum_vocabulary_size][embedding_dimension_size];
+float momentum_positional_embedding[context_length_limit][embedding_dimension_size], velocity_positional_embedding[context_length_limit][embedding_dimension_size];
 
-// ----------------------------------------------------------------------------
-// AdamW Optimization Step
-// ----------------------------------------------------------------------------
-// Computes decoupled weight decay, updates 1st (m) & 2nd (v) moments with bias
-// correction, and updates weight array w.
-void adamw_step(float lr, int t_step, float beta1 = 0.9f, float beta2 = 0.999f, float eps = 1e-8f, float weight_decay = 0.01f)
+std::mt19937 random_number_generator(42);
+
+// ============================================================================
+// OPTIMIZER & ACTIVATION FUNCTIONS
+// ============================================================================
+void execute_adamw_optimizer_step(float learning_rate, int current_step, float beta_one = 0.9f, float beta_two = 0.999f, float epsilon = 1e-8f, float weight_decay = 0.01f)
 {
-    // Bias correction factors to compensate for initial zero values in m and v
-    float bias_correction1 = 1.0f - powf(beta1, t_step + 1);
-    float bias_correction2 = 1.0f - powf(beta2, t_step + 1);
+    float bias_correction_one = 1.0f - powf(beta_one, current_step + 1);
+    float bias_correction_two = 1.0f - powf(beta_two, current_step + 1);
 
-    #define ADAMW_UPDATE(w, gw, m, v, size) \
-        for (int i = 0; i < (size); i++) { \
-            float* w_ptr  = ((float*)(w)) + i; \
-            float* g_ptr  = ((float*)(gw)) + i; \
-            float* m_ptr  = ((float*)(m)) + i; \
-            float* v_ptr  = ((float*)(v)) + i; \
-            /* Decoupled Weight Decay */ \
-            *w_ptr -= lr * weight_decay * (*w_ptr); \
-            /* Update 1st and 2nd moment estimates */ \
-            *m_ptr = beta1 * (*m_ptr) + (1.0f - beta1) * (*g_ptr); \
-            *v_ptr = beta2 * (*v_ptr) + (1.0f - beta2) * (*g_ptr) * (*g_ptr); \
-            /* Bias-corrected moment estimates */ \
-            float m_hat = *m_ptr / bias_correction1; \
-            float v_hat = *v_ptr / bias_correction2; \
-            /* Parameter Update */ \
-            *w_ptr -= lr * m_hat / (sqrtf(v_hat) + eps); \
+    #define APPLY_ADAMW_UPDATE(weight_array, gradient_array, momentum_array, velocity_array, total_size) \
+        for (int index = 0; index < (total_size); index++) { \
+            float* weight_pointer    = ((float*)(weight_array)) + index; \
+            float* gradient_pointer  = ((float*)(gradient_array)) + index; \
+            float* momentum_pointer  = ((float*)(momentum_array)) + index; \
+            float* velocity_pointer  = ((float*)(velocity_array)) + index; \
+            *weight_pointer -= learning_rate * weight_decay * (*weight_pointer); \
+            *momentum_pointer = beta_one * (*momentum_pointer) + (1.0f - beta_one) * (*gradient_pointer); \
+            *velocity_pointer = beta_two * (*velocity_pointer) + (1.0f - beta_two) * (*gradient_pointer) * (*gradient_pointer); \
+            float momentum_hat = *momentum_pointer / bias_correction_one; \
+            float velocity_hat = *velocity_pointer / bias_correction_two; \
+            *weight_pointer -= learning_rate * momentum_hat / (sqrtf(velocity_hat) + epsilon); \
         }
 
-    ADAMW_UPDATE(token_embedding, g_token_embedding, m_token_embedding, v_token_embedding, VOCAB * D_MODEL);
-    ADAMW_UPDATE(pos_embedding, g_pos_embedding, m_pos_embedding, v_pos_embedding, Context_LEN * D_MODEL);
-    ADAMW_UPDATE(W_Q, g_W_Q, m_W_Q, v_W_Q, N_LAYERS * N_HEADS * D_HEAD * D_MODEL);
-    ADAMW_UPDATE(W_K, g_W_K, m_W_K, v_W_K, N_LAYERS * N_HEADS * D_HEAD * D_MODEL);
-    ADAMW_UPDATE(W_V, g_W_V, m_W_V, v_W_V, N_LAYERS * N_HEADS * D_HEAD * D_MODEL);
-    ADAMW_UPDATE(W_O, g_W_O, m_W_O, v_W_O, N_LAYERS * D_MODEL * D_MODEL);
-    ADAMW_UPDATE(W_mlp1, g_W_mlp1, m_W_mlp1, v_W_mlp1, N_LAYERS * D_MLP * D_MODEL);
-    ADAMW_UPDATE(W_mlp2, g_W_mlp2, m_W_mlp2, v_W_mlp2, N_LAYERS * D_MODEL * D_MLP);
-    ADAMW_UPDATE(ln_attn_scale, g_ln_attn_scale, m_ln_attn_scale, v_ln_attn_scale, N_LAYERS * D_MODEL);
-    ADAMW_UPDATE(ln_attn_bias,  g_ln_attn_bias,  m_ln_attn_bias,  v_ln_attn_bias,  N_LAYERS * D_MODEL);
-    ADAMW_UPDATE(ln_mlp_scale,  g_ln_mlp_scale,  m_ln_mlp_scale,  v_ln_mlp_scale,  N_LAYERS * D_MODEL);
-    ADAMW_UPDATE(ln_mlp_bias,   g_ln_mlp_bias,   m_ln_mlp_bias,   v_ln_mlp_bias,   N_LAYERS * D_MODEL);
-    ADAMW_UPDATE(ln_final_scale, g_ln_final_scale, m_ln_final_scale, v_ln_final_scale, D_MODEL);
-    ADAMW_UPDATE(ln_final_bias,  g_ln_final_bias,  m_ln_final_bias,  v_ln_final_bias,  D_MODEL);
-    ADAMW_UPDATE(W_unembed, g_W_unembed, m_W_unembed, v_W_unembed, VOCAB * D_MODEL);
+    APPLY_ADAMW_UPDATE(token_embedding_parameters, token_embedding_gradient_buffer, momentum_token_embedding, velocity_token_embedding, current_vocabulary_size * embedding_dimension_size);
+    APPLY_ADAMW_UPDATE(positional_embedding_parameters, positional_embedding_gradient_buffer, momentum_positional_embedding, velocity_positional_embedding, context_length_limit * embedding_dimension_size);
+    APPLY_ADAMW_UPDATE(query_projection_weight_matrix, query_projection_weight_gradient_matrix, momentum_query_projection, velocity_query_projection, total_transformer_layers * attention_head_count * attention_head_dimension * embedding_dimension_size);
+    APPLY_ADAMW_UPDATE(key_projection_weight_matrix, key_projection_weight_gradient_matrix, momentum_key_projection, velocity_key_projection, total_transformer_layers * attention_head_count * attention_head_dimension * embedding_dimension_size);
+    APPLY_ADAMW_UPDATE(value_projection_weight_matrix, value_projection_weight_gradient_matrix, momentum_value_projection, velocity_value_projection, total_transformer_layers * attention_head_count * attention_head_dimension * embedding_dimension_size);
+    APPLY_ADAMW_UPDATE(output_projection_weight_matrix, output_projection_weight_gradient_matrix, momentum_output_projection, velocity_output_projection, total_transformer_layers * embedding_dimension_size * embedding_dimension_size);
+    APPLY_ADAMW_UPDATE(feed_forward_expansion_weight_matrix, feed_forward_expansion_weight_gradient_matrix, momentum_feed_forward_expansion, velocity_feed_forward_expansion, total_transformer_layers * feed_forward_hidden_dimension_size * embedding_dimension_size);
+    APPLY_ADAMW_UPDATE(feed_forward_contraction_weight_matrix, feed_forward_contraction_weight_gradient_matrix, momentum_feed_forward_contraction, velocity_feed_forward_contraction, total_transformer_layers * embedding_dimension_size * feed_forward_hidden_dimension_size);
+    APPLY_ADAMW_UPDATE(attention_layer_normalization_scale_parameters, attention_layer_normalization_scale_gradient_parameters, momentum_attention_scale_parameters, velocity_attention_scale_parameters, total_transformer_layers * embedding_dimension_size);
+    APPLY_ADAMW_UPDATE(attention_layer_normalization_bias_parameters, attention_layer_normalization_bias_gradient_parameters, momentum_attention_bias_parameters, velocity_attention_bias_parameters, total_transformer_layers * embedding_dimension_size);
+    APPLY_ADAMW_UPDATE(feed_forward_layer_normalization_scale_parameters, feed_forward_layer_normalization_scale_gradient_parameters, momentum_feed_forward_scale_parameters, velocity_feed_forward_scale_parameters, total_transformer_layers * embedding_dimension_size);
+    APPLY_ADAMW_UPDATE(feed_forward_layer_normalization_bias_parameters, feed_forward_layer_normalization_bias_gradient_parameters, momentum_feed_forward_bias_parameters, velocity_feed_forward_bias_parameters, total_transformer_layers * embedding_dimension_size);
+    APPLY_ADAMW_UPDATE(final_layer_normalization_scale_parameters, final_layer_normalization_scale_gradient_parameters, momentum_final_scale_parameters, velocity_final_scale_parameters, embedding_dimension_size);
+    APPLY_ADAMW_UPDATE(final_layer_normalization_bias_parameters, final_layer_normalization_bias_gradient_parameters, momentum_final_bias_parameters, velocity_final_bias_parameters, embedding_dimension_size);
+    APPLY_ADAMW_UPDATE(unembedding_projection_weight_matrix, unembedding_projection_weight_gradient_matrix, momentum_unembedding_projection, velocity_unembedding_projection, current_vocabulary_size * embedding_dimension_size);
 
-    #undef ADAMW_UPDATE
+    #undef APPLY_ADAMW_UPDATE
 }
 
-// ============================================================================
-// ACTIVATION FUNCTIONS (GeLU - Gaussian Error Linear Unit)
-// ============================================================================
-// GeLU provides non-linearity: gelu(x) = x * Phi(x)
-// Used in GPT models instead of ReLU as it provides smoother gradients around 0.
-inline float gelu(float x) {
-    return 0.5f * x * (1.0f + tanhf(0.7978845608f * (x + 0.044715f * x * x)));
+inline float compute_gelu_activation(float input_value) {
+    return 0.5f * input_value * (1.0f + tanhf(0.7978845608f * (input_value + 0.044715f * input_value * input_value)));
 }
 
-// Exact derivative of the GeLU approximation for backpropagation.
-inline float gelu_grad(float x) {
-    const float kAlpha = 0.7978845608f;
-    const float kBeta  = 0.044715f;
+inline float compute_gelu_gradient(float input_value) {
+    const float alpha_constant = 0.7978845608f;
+    const float beta_constant  = 0.044715f;
 
-    float x2 = x * x;
-    float tanh_arg = kAlpha * (x + kBeta * x2);
-    float tanh_val = tanhf(tanh_arg);
+    float input_squared = input_value * input_value;
+    float tanh_argument = alpha_constant * (input_value + beta_constant * input_squared);
+    float tanh_value = tanhf(tanh_argument);
 
-    float left = 0.5f * (1.0f + tanh_val);
-    float right = 0.5f * x * (1.0f - tanh_val * tanh_val) *
-                  kAlpha * (1.0f + 2.0f * kBeta * x);
+    float left_term = 0.5f * (1.0f + tanh_value);
+    float right_term = 0.5f * input_value * (1.0f - tanh_value * tanh_value) *
+                       alpha_constant * (1.0f + 2.0f * beta_constant * input_value);
 
-    return left + right;
+    return left_term + right_term;
 }
 
-// ----------------------------------------------------------------------------
-// Learning Rate Schedule
-// ----------------------------------------------------------------------------
-// Combines linear warmup for stability at start with cosine decay for convergence.
-float get_lr(int step, int total_steps) {
-    if (step < WARMUP_STEPS) {
-        return MAX_LR * ((float)step / WARMUP_STEPS);
+float calculate_learning_rate_schedule(int current_step, int total_steps) {
+    if (current_step < learning_rate_warmup_steps) {
+        return maximum_learning_rate * ((float)current_step / learning_rate_warmup_steps);
     }
-    float progress = (float)(step - WARMUP_STEPS) / (total_steps - WARMUP_STEPS);
-    return MIN_LR + 0.5f * (MAX_LR - MIN_LR) * (1.0f + cosf(progress * 3.14159265f));
+    float training_progress = (float)(current_step - learning_rate_warmup_steps) / (total_steps - learning_rate_warmup_steps);
+    return minimum_learning_rate + 0.5f * (maximum_learning_rate - minimum_learning_rate) * (1.0f + cosf(training_progress * 3.14159265f));
 }
-    std::mt19937 rng(42);
-// ----------------------------------------------------------------------------
-// Parameter Initialization
-// ----------------------------------------------------------------------------
-// Initializes embeddings and weight projections with uniform random values.
-// Scale/Gain parameters for LayerNorm are initialized to 1.0, biases to 0.0.
-void initialize_weights()
+
+// ============================================================================
+// WEIGHT INITIALIZATION & LAYER NORMALIZATION
+// ============================================================================
+void initialize_model_weights()
 {
-    std::uniform_real_distribution<float> dis(-0.1f, 0.1f);
-    auto fill_random = [&](float* ptr, int size) { for (int i = 0; i < size; i++) ptr[i] = dis(rng); };
-    auto fill_constant = [&](float* ptr, int size, float val) { for (int i = 0; i < size; i++) ptr[i] = val; };
+    std::uniform_real_distribution<float> distribution(-0.1f, 0.1f);
+    auto fill_random_values = [&](float* pointer, int size) { for (int index = 0; index < size; index++) pointer[index] = distribution(random_number_generator); };
+    auto fill_constant_values = [&](float* pointer, int size, float value) { for (int index = 0; index < size; index++) pointer[index] = value; };
 
-    fill_random(&token_embedding[0][0], VOCAB * D_MODEL);
-    fill_random(&pos_embedding[0][0], Context_LEN * D_MODEL);
+    fill_random_values(&token_embedding_parameters[0][0], current_vocabulary_size * embedding_dimension_size);
+    fill_random_values(&positional_embedding_parameters[0][0], context_length_limit * embedding_dimension_size);
 
-    for (int layer = 0; layer < N_LAYERS; layer++) {
-        for (int h = 0; h < N_HEADS; h++) {
-            fill_random(&W_Q[layer][h][0][0], D_HEAD * D_MODEL);
-            fill_random(&W_K[layer][h][0][0], D_HEAD * D_MODEL);
-            fill_random(&W_V[layer][h][0][0], D_HEAD * D_MODEL);
+    for (int layer_index = 0; layer_index < total_transformer_layers; layer_index++) {
+        for (int head_index = 0; head_index < attention_head_count; head_index++) {
+            fill_random_values(&query_projection_weight_matrix[layer_index][head_index][0][0], attention_head_dimension * embedding_dimension_size);
+            fill_random_values(&key_projection_weight_matrix[layer_index][head_index][0][0], attention_head_dimension * embedding_dimension_size);
+            fill_random_values(&value_projection_weight_matrix[layer_index][head_index][0][0], attention_head_dimension * embedding_dimension_size);
         }
-        fill_random(&W_O[layer][0][0], D_MODEL * D_MODEL);
-        fill_random(&W_mlp1[layer][0][0], D_MLP * D_MODEL);
-        fill_random(&W_mlp2[layer][0][0], D_MODEL * D_MLP);
+        fill_random_values(&output_projection_weight_matrix[layer_index][0][0], embedding_dimension_size * embedding_dimension_size);
+        fill_random_values(&feed_forward_expansion_weight_matrix[layer_index][0][0], feed_forward_hidden_dimension_size * embedding_dimension_size);
+        fill_random_values(&feed_forward_contraction_weight_matrix[layer_index][0][0], embedding_dimension_size * feed_forward_hidden_dimension_size);
 
-
-        fill_constant(&ln_attn_scale[layer][0], D_MODEL, 1.0f);
-        fill_constant(&ln_attn_bias [layer][0], D_MODEL, 0.0f);
-        fill_constant(&ln_mlp_scale [layer][0], D_MODEL, 1.0f);
-        fill_constant(&ln_mlp_bias  [layer][0], D_MODEL, 0.0f);
+        fill_constant_values(&attention_layer_normalization_scale_parameters[layer_index][0], embedding_dimension_size, 1.0f);
+        fill_constant_values(&attention_layer_normalization_bias_parameters[layer_index][0], embedding_dimension_size, 0.0f);
+        fill_constant_values(&feed_forward_layer_normalization_scale_parameters[layer_index][0], embedding_dimension_size, 1.0f);
+        fill_constant_values(&feed_forward_layer_normalization_bias_parameters[layer_index][0], embedding_dimension_size, 0.0f);
     }
-    fill_constant(ln_final_scale, D_MODEL, 1.0f);
-    fill_constant(ln_final_bias,  D_MODEL, 0.0f);
-    fill_random(&W_unembed[0][0], VOCAB * D_MODEL);
+    fill_constant_values(final_layer_normalization_scale_parameters, embedding_dimension_size, 1.0f);
+    fill_constant_values(final_layer_normalization_bias_parameters, embedding_dimension_size, 0.0f);
+    fill_random_values(&unembedding_projection_weight_matrix[0][0], current_vocabulary_size * embedding_dimension_size);
 
-    printf("Dynamic model weights initialized (Vocab Size = %d, D_MODEL = %d).\n", VOCAB, D_MODEL);
+    printf("Dynamic model weights initialized successfully.\n");
 }
 
-// ============================================================================
-// LAYER NORMALIZATION (LayerNorm)
-// ============================================================================
-// Standardizes feature activations across D_MODEL per token position:
-// xhat = (x - mean) / sqrt(var + eps)
-// out  = xhat * scale + bias
-void layer_norm_forward(const float* x, const float* scale, const float* bias,
-                        float* out, float* xhat, float* inv_std_out)
+void execute_layer_normalization_forward(const float* input_vector, const float* scale_parameters, const float* bias_parameters,
+                                         float* output_vector, float* normalized_hat_vector, float* inverse_standard_deviation_output)
 {
-    float mean = 0.0f;
-    for (int i = 0; i < D_MODEL; i++) mean += x[i];
-    mean /= D_MODEL;
+    float mean_value = 0.0f;
+    for (int index = 0; index < embedding_dimension_size; index++) mean_value += input_vector[index];
+    mean_value /= embedding_dimension_size;
 
-    float var = 0.0f;
-    for (int i = 0; i < D_MODEL; i++) {
-        float diff = x[i] - mean;
-        var += diff * diff;
+    float variance_value = 0.0f;
+    for (int index = 0; index < embedding_dimension_size; index++) {
+        float difference = input_vector[index] - mean_value;
+        variance_value += difference * difference;
     }
-    var /= D_MODEL;
+    variance_value /= embedding_dimension_size;
 
-    float is = 1.0f / sqrtf(var + 1e-5f);
-    *inv_std_out = is;
+    float inverse_standard_deviation = 1.0f / sqrtf(variance_value + 1e-5f);
+    *inverse_standard_deviation_output = inverse_standard_deviation;
 
-    for (int i = 0; i < D_MODEL; i++) {
-        xhat[i] = (x[i] - mean) * is;
-        out[i] = xhat[i] * scale[i] + bias[i];
+    for (int index = 0; index < embedding_dimension_size; index++) {
+        normalized_hat_vector[index] = (input_vector[index] - mean_value) * inverse_standard_deviation;
+        output_vector[index] = normalized_hat_vector[index] * scale_parameters[index] + bias_parameters[index];
     }
 }
 
-// Backward pass for LayerNorm: calculates gradients w.r.t input (dx) and scale/bias parameters.
-void layer_norm_backward(const float* dy, const float* xhat, float inv_std,
-                         const float* scale, float* dx,
-                         float* d_scale, float* d_bias)
+void execute_layer_normalization_backward(const float* gradient_output_vector, const float* normalized_hat_vector, float inverse_standard_deviation,
+                                          const float* scale_parameters, float* gradient_input_vector,
+                                          float* gradient_scale_parameters, float* gradient_bias_parameters)
 {
-    for (int i = 0; i < D_MODEL; i++) {
-        d_scale[i] += dy[i] * xhat[i];
-        d_bias[i]  += dy[i];
+    for (int index = 0; index < embedding_dimension_size; index++) {
+        gradient_scale_parameters[index] += gradient_output_vector[index] * normalized_hat_vector[index];
+        gradient_bias_parameters[index]  += gradient_output_vector[index];
     }
-    float d_xhat[D_MODEL];
-    for (int i = 0; i < D_MODEL; i++) d_xhat[i] = dy[i] * scale[i];
+    float gradient_normalized_hat[embedding_dimension_size];
+    for (int index = 0; index < embedding_dimension_size; index++) gradient_normalized_hat[index] = gradient_output_vector[index] * scale_parameters[index];
 
-    float mean_dxhat = 0.0f;
-    for (int i = 0; i < D_MODEL; i++) mean_dxhat += d_xhat[i];
-    mean_dxhat /= D_MODEL;
+    float mean_gradient_normalized_hat = 0.0f;
+    for (int index = 0; index < embedding_dimension_size; index++) mean_gradient_normalized_hat += gradient_normalized_hat[index];
+    mean_gradient_normalized_hat /= embedding_dimension_size;
 
-    float mean_dxhat_xhat = 0.0f;
-    for (int i = 0; i < D_MODEL; i++) mean_dxhat_xhat += d_xhat[i] * xhat[i];
-    mean_dxhat_xhat /= D_MODEL;
+    float mean_gradient_normalized_hat_times_hat = 0.0f;
+    for (int index = 0; index < embedding_dimension_size; index++) mean_gradient_normalized_hat_times_hat += gradient_normalized_hat[index] * normalized_hat_vector[index];
+    mean_gradient_normalized_hat_times_hat /= embedding_dimension_size;
 
-    for (int i = 0; i < D_MODEL; i++)
-        dx[i] = inv_std * (d_xhat[i] - mean_dxhat - xhat[i] * mean_dxhat_xhat);
+    for (int index = 0; index < embedding_dimension_size; index++)
+        gradient_input_vector[index] = inverse_standard_deviation * (gradient_normalized_hat[index] - mean_gradient_normalized_hat - normalized_hat_vector[index] * mean_gradient_normalized_hat_times_hat);
 }
 
-// Reset gradient arrays before calculating backpropagation for a batch.
-void zero_gradients()
+void reset_all_gradients()
 {
-    memset(g_token_embedding, 0, sizeof(g_token_embedding));
-    memset(g_pos_embedding, 0, sizeof(g_pos_embedding));
-    memset(g_W_Q,  0, sizeof(g_W_Q));
-    memset(g_W_K,  0, sizeof(g_W_K));
-    memset(g_W_V,  0, sizeof(g_W_V));
-    memset(g_W_O,  0, sizeof(g_W_O));
-    memset(g_W_mlp1, 0, sizeof(g_W_mlp1));
-    memset(g_W_mlp2, 0, sizeof(g_W_mlp2));
-    memset(g_ln_attn_scale, 0, sizeof(g_ln_attn_scale));
-    memset(g_ln_attn_bias,  0, sizeof(g_ln_attn_bias));
-    memset(g_ln_mlp_scale, 0, sizeof(g_ln_mlp_scale));
-    memset(g_ln_mlp_bias,   0, sizeof(g_ln_mlp_bias));
-    memset(g_ln_final_scale, 0, sizeof(g_ln_final_scale));
-    memset(g_ln_final_bias,  0, sizeof(g_ln_final_bias));
-    memset(g_W_unembed, 0, sizeof(g_W_unembed));
+    memset(token_embedding_gradient_buffer, 0, sizeof(token_embedding_gradient_buffer));
+    memset(positional_embedding_gradient_buffer, 0, sizeof(positional_embedding_gradient_buffer));
+    memset(query_projection_weight_gradient_matrix, 0, sizeof(query_projection_weight_gradient_matrix));
+    memset(key_projection_weight_gradient_matrix, 0, sizeof(key_projection_weight_gradient_matrix));
+    memset(value_projection_weight_gradient_matrix, 0, sizeof(value_projection_weight_gradient_matrix));
+    memset(output_projection_weight_gradient_matrix, 0, sizeof(output_projection_weight_gradient_matrix));
+    memset(feed_forward_expansion_weight_gradient_matrix, 0, sizeof(feed_forward_expansion_weight_gradient_matrix));
+    memset(feed_forward_contraction_weight_gradient_matrix, 0, sizeof(feed_forward_contraction_weight_gradient_matrix));
+    memset(attention_layer_normalization_scale_gradient_parameters, 0, sizeof(attention_layer_normalization_scale_gradient_parameters));
+    memset(attention_layer_normalization_bias_gradient_parameters, 0, sizeof(attention_layer_normalization_bias_gradient_parameters));
+    memset(feed_forward_layer_normalization_scale_gradient_parameters, 0, sizeof(feed_forward_layer_normalization_scale_gradient_parameters));
+    memset(feed_forward_layer_normalization_bias_gradient_parameters, 0, sizeof(feed_forward_layer_normalization_bias_gradient_parameters));
+    memset(final_layer_normalization_scale_gradient_parameters, 0, sizeof(final_layer_normalization_scale_gradient_parameters));
+    memset(final_layer_normalization_bias_gradient_parameters, 0, sizeof(final_layer_normalization_bias_gradient_parameters));
+    memset(unembedding_projection_weight_gradient_matrix, 0, sizeof(unembedding_projection_weight_gradient_matrix));
 }
 
 // ============================================================================
 // FORWARD PASS
 // ============================================================================
-// Executes full forward pass:
-// 1. Embedding lookup (Token + Positional embeddings).
-// 2. Transformer layers (Pre-LN -> Multi-Head Causal Self-Attention -> Residual -> Pre-LN -> MLP -> Residual).
-// 3. Final LayerNorm & Unembedding projection to compute vocabulary logits.
-// 4. Categorical Cross-Entropy Loss over sequence.
-float forward_pass(int* tokens, int* targets, int seq_len)
+float execute_forward_pass(int* token_indices, int* target_indices, int sequence_length)
 {
-    // STEP 1: EMBEDDINGS (Token Embedding + Learned Positional Embedding)
-    for (int pos = 0; pos < seq_len; pos++)
-        for (int d = 0; d < D_MODEL; d++)
-            residual[pos][d] = token_embedding[tokens[pos]][d] + pos_embedding[pos][d];
+    for (int position = 0; position < sequence_length; position++)
+        for (int dimension = 0; dimension < embedding_dimension_size; dimension++)
+            residual_stream_buffer[position][dimension] = token_embedding_parameters[token_indices[position]][dimension] + positional_embedding_parameters[position][dimension];
 
-    // Scaling factor 1 / sqrt(d_k) for Scaled Dot-Product Attention
-    float scale = 1.0f / sqrtf((float)D_HEAD);
+    float attention_scaling_factor = 1.0f / sqrtf((float)attention_head_dimension);
 
-    // STEP 2: TRANSFORMER BLOCK STACK
-    for (int layer = 0; layer < N_LAYERS; layer++)
+    for (int layer_index = 0; layer_index < total_transformer_layers; layer_index++)
     {
-        // 2a. Pre-Layer Normalization for Attention Block
-        for (int pos = 0; pos < seq_len; pos++)
-            layer_norm_forward(residual[pos], ln_attn_scale[layer], ln_attn_bias[layer],
-                             s_normed_attn[layer][pos], s_xhat_attn[layer][pos], &s_inv_std_attn[layer][pos]);
+        for (int position = 0; position < sequence_length; position++)
+            execute_layer_normalization_forward(residual_stream_buffer[position], attention_layer_normalization_scale_parameters[layer_index], attention_layer_normalization_bias_parameters[layer_index],
+                                             saved_attention_normalized_values[layer_index][position], saved_attention_normalized_hat[layer_index][position], &saved_attention_inverse_standard_deviation[layer_index][position]);
 
-        // 2b. Compute Query, Key, and Value Projections across all Attention Heads
-        //     Q = Normed * W_Q, K = Normed * W_K, V = Normed * W_V
-        for (int h = 0; h < N_HEADS; h++) {
-            int offset = h * D_HEAD;
-            for (int pos = 0; pos < seq_len; pos++) {
-                for (int dh = 0; dh < D_HEAD; dh++) {
-                    float qv = 0, kv = 0, vv = 0;
-                    const float* norm_ptr = s_normed_attn[layer][pos];
-                    for (int d = 0; d < D_MODEL; d++) {
-                        qv += W_Q[layer][h][dh][d] * norm_ptr[d];
-                        kv += W_K[layer][h][dh][d] * norm_ptr[d];
-                        vv += W_V[layer][h][dh][d] * norm_ptr[d];
+        for (int head_index = 0; head_index < attention_head_count; head_index++) {
+            for (int position = 0; position < sequence_length; position++) {
+                for (int head_dimension_index = 0; head_dimension_index < attention_head_dimension; head_dimension_index++) {
+                    float query_accumulator = 0, key_accumulator = 0, value_accumulator = 0;
+                    const float* normalized_pointer = saved_attention_normalized_values[layer_index][position];
+                    for (int dimension = 0; dimension < embedding_dimension_size; dimension++) {
+                        query_accumulator += query_projection_weight_matrix[layer_index][head_index][head_dimension_index][dimension] * normalized_pointer[dimension];
+                        key_accumulator   += key_projection_weight_matrix[layer_index][head_index][head_dimension_index][dimension] * normalized_pointer[dimension];
+                        value_accumulator += value_projection_weight_matrix[layer_index][head_index][head_dimension_index][dimension] * normalized_pointer[dimension];
                     }
-                    s_q[layer][h][pos][dh] = qv;
-                    s_k[layer][h][pos][dh] = kv;
-                    s_v[layer][h][pos][dh] = vv;
+                    saved_query_vectors[layer_index][head_index][position][head_dimension_index] = query_accumulator;
+                    saved_key_vectors[layer_index][head_index][position][head_dimension_index] = key_accumulator;
+                    saved_value_vectors[layer_index][head_index][position][head_dimension_index] = value_accumulator;
                 }
             }
         }
 
-        for (int pos = 0; pos < seq_len; pos++)
-            for (int d = 0; d < D_MODEL; d++)
-                s_attn_out[layer][pos][d] = 0.0f;
+        for (int position = 0; position < sequence_length; position++)
+            for (int dimension = 0; dimension < embedding_dimension_size; dimension++)
+                saved_attention_output[layer_index][position][dimension] = 0.0f;
 
-        // 2c. Scaled Dot-Product Causal Self-Attention
-        //     Attention(Q,K,V) = softmax( (Q * K^T) / sqrt(d_k) + CausalMask ) * V
-        for (int h = 0; h < N_HEADS; h++) {
-            int offset = h * D_HEAD;
-            for (int i = 0; i < seq_len; i++) {
-                float max_val = -1e30f;
-                // Causal Mask: Query position 'i' can only look at Key positions 'j' <= 'i'
-                for (int j = 0; j <= i; j++) {
-                    float dot = 0.0f;
-                    const float* q_ptr = s_q[layer][h][i];
-                    const float* k_ptr = s_k[layer][h][j];
-                    for (int dh = 0; dh < D_HEAD; dh++)
-                        dot += q_ptr[dh] * k_ptr[dh];
-                    float val = dot * scale;
-                    s_attn_w[layer][h][i][j] = val;
-                    if (val > max_val) max_val = val;
+        for (int head_index = 0; head_index < attention_head_count; head_index++) {
+            int head_offset = head_index * attention_head_dimension;
+            for (int query_position = 0; query_position < sequence_length; query_position++) {
+                float maximum_score_value = -1e30f;
+                for (int key_position = 0; key_position <= query_position; key_position++) {
+                    float dot_product_accumulator = 0.0f;
+                    const float* query_pointer = saved_query_vectors[layer_index][head_index][query_position];
+                    const float* key_pointer = saved_key_vectors[layer_index][head_index][key_position];
+                    for (int head_dimension_index = 0; head_dimension_index < attention_head_dimension; head_dimension_index++)
+                        dot_product_accumulator += query_pointer[head_dimension_index] * key_pointer[head_dimension_index];
+                    float scaled_score = dot_product_accumulator * attention_scaling_factor;
+                    saved_attention_weights[layer_index][head_index][query_position][key_position] = scaled_score;
+                    if (scaled_score > maximum_score_value) maximum_score_value = scaled_score;
                 }
-                // Mask out future positions (j > i) with negative infinity
-                for (int j = i + 1; j < seq_len; j++)
-                    s_attn_w[layer][h][i][j] = -1e30f;
+                for (int key_position = query_position + 1; key_position < sequence_length; key_position++)
+                    saved_attention_weights[layer_index][head_index][query_position][key_position] = -1e30f;
 
-                // Softmax normalization over row i
-                float sum = 0.0f;
-                for (int j = 0; j <= i; j++) {
-                    float ev = expf(s_attn_w[layer][h][i][j] - max_val);
-                    s_attn_w[layer][h][i][j] = ev;
-                    sum += ev;
+                float exponential_sum = 0.0f;
+                for (int key_position = 0; key_position <= query_position; key_position++) {
+                    float exponentiated_value = expf(saved_attention_weights[layer_index][head_index][query_position][key_position] - maximum_score_value);
+                    saved_attention_weights[layer_index][head_index][query_position][key_position] = exponentiated_value;
+                    exponential_sum += exponentiated_value;
                 }
-                float inv_sum = 1.0f / sum;
-                for (int j = 0; j <= i; j++) {
-                    s_attn_w[layer][h][i][j] *= inv_sum;
+                float inverse_exponential_sum = 1.0f / exponential_sum;
+                for (int key_position = 0; key_position <= query_position; key_position++) {
+                    saved_attention_weights[layer_index][head_index][query_position][key_position] *= inverse_exponential_sum;
                 }
 
-                // Weighted sum over Value vectors
-                for (int j = 0; j <= i; j++) {
-                    float weight = s_attn_w[layer][h][i][j];
-                    const float* v_ptr = s_v[layer][h][j];
-                    float* out_ptr = &s_attn_out[layer][i][offset];
-                    for (int dh = 0; dh < D_HEAD; dh++)
-                        out_ptr[dh] += weight * v_ptr[dh];
+                for (int key_position = 0; key_position <= query_position; key_position++) {
+                    float attention_weight = saved_attention_weights[layer_index][head_index][query_position][key_position];
+                    const float* value_pointer = saved_value_vectors[layer_index][head_index][key_position];
+                    float* output_pointer = &saved_attention_output[layer_index][query_position][head_offset];
+                    for (int head_dimension_index = 0; head_dimension_index < attention_head_dimension; head_dimension_index++)
+                        output_pointer[head_dimension_index] += attention_weight * value_pointer[head_dimension_index];
                 }
             }
         }
 
-        // 2d. Output Projection & Residual Connection (Attn Sub-layer)
-        //     residual = residual + W_O * attn_out
-        for (int pos = 0; pos < seq_len; pos++) {
-            for (int d = 0; d < D_MODEL; d++) {
-                float val = 0.0f;
-                const float* attn_out_ptr = s_attn_out[layer][pos];
-                const float* w_o_ptr = W_O[layer][d];
-                for (int d2 = 0; d2 < D_MODEL; d2++)
-                    val += w_o_ptr[d2] * attn_out_ptr[d2];
-                residual[pos][d] += val;
+        for (int position = 0; position < sequence_length; position++) {
+            for (int dimension = 0; dimension < embedding_dimension_size; dimension++) {
+                float projection_accumulator = 0.0f;
+                const float* attention_output_pointer = saved_attention_output[layer_index][position];
+                const float* output_weight_pointer = output_projection_weight_matrix[layer_index][dimension];
+                for (int inner_dimension = 0; inner_dimension < embedding_dimension_size; inner_dimension++)
+                    projection_accumulator += output_weight_pointer[inner_dimension] * attention_output_pointer[inner_dimension];
+                residual_stream_buffer[position][dimension] += projection_accumulator;
             }
         }
 
-        // 2e. Pre-Layer Normalization for MLP Block
-        for (int pos = 0; pos < seq_len; pos++)
-            layer_norm_forward(residual[pos], ln_mlp_scale[layer], ln_mlp_bias[layer],
-                             s_normed_mlp[layer][pos], s_xhat_mlp[layer][pos], &s_inv_std_mlp[layer][pos]);
+        for (int position = 0; position < sequence_length; position++)
+            execute_layer_normalization_forward(residual_stream_buffer[position], feed_forward_layer_normalization_scale_parameters[layer_index], feed_forward_layer_normalization_bias_parameters[layer_index],
+                                             saved_feed_forward_normalized_values[layer_index][position], saved_feed_forward_normalized_hat[layer_index][position], &saved_feed_forward_inverse_standard_deviation[layer_index][position]);
 
-        // 2f. Feed-Forward Network (MLP) & Residual Connection
-        //     MLP(x) = W_mlp2 * GeLU(W_mlp1 * x)
-        for (int pos = 0; pos < seq_len; pos++) {
-            // Expansion layer: D_MODEL -> D_MLP
-            for (int m = 0; m < D_MLP; m++) {
-                float val = 0.0f;
-                const float* norm_ptr = s_normed_mlp[layer][pos];
-                const float* w_mlp1_ptr = W_mlp1[layer][m];
-                for (int d = 0; d < D_MODEL; d++)
-                    val += w_mlp1_ptr[d] * norm_ptr[d];
-                s_mlp_pre_relu[layer][pos][m] = val; 
+        for (int position = 0; position < sequence_length; position++) {
+            for (int hidden_index = 0; hidden_index < feed_forward_hidden_dimension_size; hidden_index++) {
+                float expansion_accumulator = 0.0f;
+                const float* normalized_pointer = saved_feed_forward_normalized_values[layer_index][position];
+                const float* expansion_weight_pointer = feed_forward_expansion_weight_matrix[layer_index][hidden_index];
+                for (int dimension = 0; dimension < embedding_dimension_size; dimension++)
+                    expansion_accumulator += expansion_weight_pointer[dimension] * normalized_pointer[dimension];
+                saved_feed_forward_pre_activation[layer_index][position][hidden_index] = expansion_accumulator; 
             }
-            // Non-linear activation (GeLU) + Contraction layer (D_MLP -> D_MODEL) + Residual Add
-            for (int d = 0; d < D_MODEL; d++) {
-                float val = 0.0f;
-                const float* w_mlp2_ptr = W_mlp2[layer][d];
-                for (int m = 0; m < D_MLP; m++) {
-                    float gelu_out = gelu(s_mlp_pre_relu[layer][pos][m]);
-                    val += w_mlp2_ptr[m] * gelu_out;
+            for (int dimension = 0; dimension < embedding_dimension_size; dimension++) {
+                float contraction_accumulator = 0.0f;
+                const float* contraction_weight_pointer = feed_forward_contraction_weight_matrix[layer_index][dimension];
+                for (int hidden_index = 0; hidden_index < feed_forward_hidden_dimension_size; hidden_index++) {
+                    float gelu_activation_output = compute_gelu_activation(saved_feed_forward_pre_activation[layer_index][position][hidden_index]);
+                    contraction_accumulator += contraction_weight_pointer[hidden_index] * gelu_activation_output;
                 }
-                residual[pos][d] += val;
-
+                residual_stream_buffer[position][dimension] += contraction_accumulator;
             }
-
         }
     }
 
-    // STEP 3: FINAL LAYERNORM & UNEMBEDDING HEAD (LOGITS)
-    for (int pos = 0; pos < seq_len; pos++) {
-        layer_norm_forward(residual[pos], ln_final_scale, ln_final_bias,
-                         s_normed_final[pos], s_xhat_final[pos], &s_inv_std_final[pos]);
+    for (int position = 0; position < sequence_length; position++) {
+        execute_layer_normalization_forward(residual_stream_buffer[position], final_layer_normalization_scale_parameters, final_layer_normalization_bias_parameters,
+                                         saved_final_normalized_values[position], saved_final_normalized_hat[position], &saved_final_inverse_standard_deviation[position]);
 
-        for (int voc = 0; voc < VOCAB; voc++) {
-            float val = 0.0f;
-            const float* unembed_ptr = W_unembed[voc];
-            const float* final_ptr = s_normed_final[pos];
-            for (int d = 0; d < D_MODEL; d++)
-                val += unembed_ptr[d] * final_ptr[d];
-            logits[pos][voc] = val;
+        for (int vocabulary_index = 0; vocabulary_index < current_vocabulary_size; vocabulary_index++) {
+            float logit_accumulator = 0.0f;
+            const float* unembedding_pointer = unembedding_projection_weight_matrix[vocabulary_index];
+            const float* final_normalized_pointer = saved_final_normalized_values[position];
+            for (int dimension = 0; dimension < embedding_dimension_size; dimension++)
+                logit_accumulator += unembedding_pointer[dimension] * final_normalized_pointer[dimension];
+            vocabulary_logits_buffer[position][vocabulary_index] = logit_accumulator;
         }
     }
 
-    // STEP 4: CATEGORICAL CROSS-ENTROPY LOSS COMPUTATION
-    // Loss = -log( softmax(logits)[target_token] )
-    float loss = 0.0f;
-    for (int pos = 0; pos < seq_len; pos++) {
-        float max_val = logits[pos][0];
-        for (int v = 1; v < VOCAB; v++)
-            if (logits[pos][v] > max_val) max_val = logits[pos][v];
-        float sum_exp = 0.0f;
-        for (int v = 0; v < VOCAB; v++) sum_exp += expf(logits[pos][v] - max_val);
-        loss -= (logits[pos][targets[pos]] - (max_val + logf(sum_exp)));
+    float total_cross_entropy_loss = 0.0f;
+    for (int position = 0; position < sequence_length; position++) {
+        float maximum_logit = vocabulary_logits_buffer[position][0];
+        for (int vocabulary_index = 1; vocabulary_index < current_vocabulary_size; vocabulary_index++)
+            if (vocabulary_logits_buffer[position][vocabulary_index] > maximum_logit) maximum_logit = vocabulary_logits_buffer[position][vocabulary_index];
+        float exponential_sum = 0.0f;
+        for (int vocabulary_index = 0; vocabulary_index < current_vocabulary_size; vocabulary_index++) exponential_sum += expf(vocabulary_logits_buffer[position][vocabulary_index] - maximum_logit);
+        total_cross_entropy_loss -= (vocabulary_logits_buffer[position][target_indices[position]] - (maximum_logit + logf(exponential_sum)));
     }
-    return loss / seq_len;
+    return total_cross_entropy_loss / sequence_length;
 }
 
 // ============================================================================
-// BACKWARD PASS (Backpropagation Through Time / Reverse Computational Graph)
+// BACKWARD PASS
 // ============================================================================
-// Calculates exact parameter gradients using chain rule from Loss -> Logits ->
-// Unembed -> Final LayerNorm -> Layers (MLP -> Attn) -> Embeddings.
-void backward_pass(int* tokens, int* targets, int seq_len)
+void execute_backward_pass(int* token_indices, int* target_indices, int sequence_length)
 {
-    float scale = 1.0f / sqrtf((float)D_HEAD);
+    float attention_scaling_factor = 1.0f / sqrtf((float)attention_head_dimension);
 
-    // STEP 1: SOFTMAX & CROSS-ENTROPY LOSS GRADIENTS w.r.t LOGITS
-    // dL/d(logit_v) = p_v - y_v
-    for (int pos = 0; pos < seq_len; pos++) {
-        float max_val = logits[pos][0];
-        for (int v = 1; v < VOCAB; v++)
-            if (logits[pos][v] > max_val) max_val = logits[pos][v];
-        float sum_exp = 0.0f;
-        for (int v = 0; v < VOCAB; v++) {
-            d_logits[pos][v] = expf(logits[pos][v] - max_val);
-            sum_exp += d_logits[pos][v];
+    for (int position = 0; position < sequence_length; position++) {
+        float maximum_logit = vocabulary_logits_buffer[position][0];
+        for (int vocabulary_index = 1; vocabulary_index < current_vocabulary_size; vocabulary_index++)
+            if (vocabulary_logits_buffer[position][vocabulary_index] > maximum_logit) maximum_logit = vocabulary_logits_buffer[position][vocabulary_index];
+        float exponential_sum = 0.0f;
+        for (int vocabulary_index = 0; vocabulary_index < current_vocabulary_size; vocabulary_index++) {
+            logits_gradient_buffer[position][vocabulary_index] = expf(vocabulary_logits_buffer[position][vocabulary_index] - maximum_logit);
+            exponential_sum += logits_gradient_buffer[position][vocabulary_index];
         }
-        for (int v = 0; v < VOCAB; v++) {
-            d_logits[pos][v] /= sum_exp;
-            if (v == targets[pos]) d_logits[pos][v] -= 1.0f;
-            d_logits[pos][v] /= seq_len;
+        for (int vocabulary_index = 0; vocabulary_index < current_vocabulary_size; vocabulary_index++) {
+            logits_gradient_buffer[position][vocabulary_index] /= exponential_sum;
+            if (vocabulary_index == target_indices[position]) logits_gradient_buffer[position][vocabulary_index] -= 1.0f;
+            logits_gradient_buffer[position][vocabulary_index] /= sequence_length;
         }
     }
 
-    // STEP 2: UNEMBEDDING HEAD BACKWARD PASS
-    float d_normed_final[Context_LEN][D_MODEL];
-    memset(d_normed_final, 0, sizeof(d_normed_final));
-    for (int pos = 0; pos < seq_len; pos++)
-        for (int v = 0; v < VOCAB; v++) {
-            for (int d = 0; d < D_MODEL; d++) {
-                d_normed_final[pos][d] += d_logits[pos][v] * W_unembed[v][d];
-                g_W_unembed[v][d] += d_logits[pos][v] * s_normed_final[pos][d];
+    float local_final_normalized_gradient[context_length_limit][embedding_dimension_size];
+    memset(local_final_normalized_gradient, 0, sizeof(local_final_normalized_gradient));
+    for (int position = 0; position < sequence_length; position++)
+        for (int vocabulary_index = 0; vocabulary_index < current_vocabulary_size; vocabulary_index++) {
+            for (int dimension = 0; dimension < embedding_dimension_size; dimension++) {
+                local_final_normalized_gradient[position][dimension] += logits_gradient_buffer[position][vocabulary_index] * unembedding_projection_weight_matrix[vocabulary_index][dimension];
+                unembedding_projection_weight_gradient_matrix[vocabulary_index][dimension] += logits_gradient_buffer[position][vocabulary_index] * saved_final_normalized_values[position][dimension];
             }
         }
 
-    // STEP 3: FINAL LAYERNORM BACKWARD PASS
-    memset(d_residual, 0, sizeof(d_residual));
-    for (int pos = 0; pos < seq_len; pos++)
-        layer_norm_backward(d_normed_final[pos], s_xhat_final[pos], s_inv_std_final[pos],
-                          ln_final_scale, d_residual[pos], g_ln_final_scale, g_ln_final_bias);
+    memset(residual_gradient_buffer, 0, sizeof(residual_gradient_buffer));
+    for (int position = 0; position < sequence_length; position++)
+        execute_layer_normalization_backward(local_final_normalized_gradient[position], saved_final_normalized_hat[position], saved_final_inverse_standard_deviation[position],
+                                          final_layer_normalization_scale_parameters, residual_gradient_buffer[position], final_layer_normalization_scale_gradient_parameters, final_layer_normalization_bias_parameters);
 
-    // STEP 4: TRANSFORMER LAYERS BACKWARD (Reverse Order: N_LAYERS-1 down to 0)
-    for (int layer = N_LAYERS - 1; layer >= 0; layer--)
+    for (int layer_index = total_transformer_layers - 1; layer_index >= 0; layer_index--)
     {
-        // 4a. MLP Sub-layer Backward
-        for (int pos = 0; pos < seq_len; pos++) {
-            // Gradient through W_mlp2
-            float d_gelu_out[D_MLP];
-            for (int m = 0; m < D_MLP; m++) {
-                float val = 0.0f;
-                for (int d = 0; d < D_MODEL; d++)
-                    val += d_residual[pos][d] * W_mlp2[layer][d][m];
-                d_gelu_out[m] = val;
+        for (int position = 0; position < sequence_length; position++) {
+            float hidden_gradient_output[feed_forward_hidden_dimension_size];
+            for (int hidden_index = 0; hidden_index < feed_forward_hidden_dimension_size; hidden_index++) {
+                float gradient_accumulator = 0.0f;
+                for (int dimension = 0; dimension < embedding_dimension_size; dimension++)
+                    gradient_accumulator += residual_gradient_buffer[position][dimension] * feed_forward_contraction_weight_matrix[layer_index][dimension][hidden_index];
+                hidden_gradient_output[hidden_index] = gradient_accumulator;
             }
 
-            for (int d = 0; d < D_MODEL; d++)
-                for (int m = 0; m < D_MLP; m++) {
-                    float gelu_val = gelu(s_mlp_pre_relu[layer][pos][m]);
-                    g_W_mlp2[layer][d][m] += d_residual[pos][d] * gelu_val;
+            for (int dimension = 0; dimension < embedding_dimension_size; dimension++)
+                for (int hidden_index = 0; hidden_index < feed_forward_hidden_dimension_size; hidden_index++) {
+                    float gelu_evaluated_value = compute_gelu_activation(saved_feed_forward_pre_activation[layer_index][position][hidden_index]);
+                    feed_forward_contraction_weight_gradient_matrix[layer_index][dimension][hidden_index] += residual_gradient_buffer[position][dimension] * gelu_evaluated_value;
                 }
 
-            // Gradient through GeLU non-linearity
-            float d_pre_gelu[D_MLP];
-            for (int m = 0; m < D_MLP; m++)
-                d_pre_gelu[m] = d_gelu_out[m] * gelu_grad(s_mlp_pre_relu[layer][pos][m]);
+            float pre_gelu_gradient[feed_forward_hidden_dimension_size];
+            for (int hidden_index = 0; hidden_index < feed_forward_hidden_dimension_size; hidden_index++)
+                pre_gelu_gradient[hidden_index] = hidden_gradient_output[hidden_index] * compute_gelu_gradient(saved_feed_forward_pre_activation[layer_index][position][hidden_index]);
 
-            // Gradient through W_mlp1
-            float d_normed_mlp_pos[D_MODEL];
-            for (int d = 0; d < D_MODEL; d++) {
-                float val = 0.0f;
-                for (int m = 0; m < D_MLP; m++)
-                    val += d_pre_gelu[m] * W_mlp1[layer][m][d];
-                d_normed_mlp_pos[d] = val;
+            float normalized_feed_forward_gradient_position[embedding_dimension_size];
+            for (int dimension = 0; dimension < embedding_dimension_size; dimension++) {
+                float gradient_accumulator = 0.0f;
+                for (int hidden_index = 0; hidden_index < feed_forward_hidden_dimension_size; hidden_index++)
+                    gradient_accumulator += pre_gelu_gradient[hidden_index] * feed_forward_expansion_weight_matrix[layer_index][hidden_index][dimension];
+                normalized_feed_forward_gradient_position[dimension] = gradient_accumulator;
             }
 
-            for (int m = 0; m < D_MLP; m++)
-                for (int d = 0; d < D_MODEL; d++)
-                    g_W_mlp1[layer][m][d] += d_pre_gelu[m] * s_normed_mlp[layer][pos][d];
+            for (int hidden_index = 0; hidden_index < feed_forward_hidden_dimension_size; hidden_index++)
+                for (int dimension = 0; dimension < embedding_dimension_size; dimension++)
+                    feed_forward_expansion_weight_gradient_matrix[layer_index][hidden_index][dimension] += pre_gelu_gradient[hidden_index] * saved_feed_forward_normalized_values[layer_index][position][dimension];
 
-            // Gradient through Pre-MLP LayerNorm
-            float d_res_from_mlp_ln[D_MODEL];
-            layer_norm_backward(d_normed_mlp_pos, s_xhat_mlp[layer][pos], s_inv_std_mlp[layer][pos],
-                              ln_mlp_scale[layer], d_res_from_mlp_ln, g_ln_mlp_scale[layer], g_ln_mlp_bias[layer]);
+            float residual_from_feed_forward_normalization[embedding_dimension_size];
+            execute_layer_normalization_backward(normalized_feed_forward_gradient_position, saved_feed_forward_normalized_hat[layer_index][position], saved_feed_forward_inverse_standard_deviation[layer_index][position],
+                                              feed_forward_layer_normalization_scale_parameters[layer_index], residual_from_feed_forward_normalization, feed_forward_layer_normalization_scale_gradient_parameters[layer_index], feed_forward_layer_normalization_bias_parameters[layer_index]);
 
-            for (int d = 0; d < D_MODEL; d++) d_residual[pos][d] += d_res_from_mlp_ln[d];
+            for (int dimension = 0; dimension < embedding_dimension_size; dimension++) residual_gradient_buffer[position][dimension] += residual_from_feed_forward_normalization[dimension];
         }
 
-        // 4b. Multi-Head Attention Output Projection (W_O) Backward
-        memset(d_attn_out_buf, 0, sizeof(d_attn_out_buf));
-        for (int pos = 0; pos < seq_len; pos++) {
-            for (int d2 = 0; d2 < D_MODEL; d2++) {
-                float val = 0.0f;
-                for (int d = 0; d < D_MODEL; d++)
-                    val += d_residual[pos][d] * W_O[layer][d][d2];
-                d_attn_out_buf[pos][d2] = val;
+        memset(attention_output_gradient_buffer, 0, sizeof(attention_output_gradient_buffer));
+        for (int position = 0; position < sequence_length; position++) {
+            for (int inner_dimension = 0; inner_dimension < embedding_dimension_size; inner_dimension++) {
+                float gradient_accumulator = 0.0f;
+                for (int dimension = 0; dimension < embedding_dimension_size; dimension++)
+                    gradient_accumulator += residual_gradient_buffer[position][dimension] * output_projection_weight_matrix[layer_index][dimension][inner_dimension];
+                attention_output_gradient_buffer[position][inner_dimension] = gradient_accumulator;
             }
-            for (int d = 0; d < D_MODEL; d++)
-                for (int d2 = 0; d2 < D_MODEL; d2++)
-                    g_W_O[layer][d][d2] += d_residual[pos][d] * s_attn_out[layer][pos][d2];
+            for (int dimension = 0; dimension < embedding_dimension_size; dimension++)
+                for (int inner_dimension = 0; inner_dimension < embedding_dimension_size; inner_dimension++)
+                    output_projection_weight_gradient_matrix[layer_index][dimension][inner_dimension] += residual_gradient_buffer[position][dimension] * saved_attention_output[layer_index][position][inner_dimension];
         }
 
-        memset(d_q, 0, sizeof(d_q));
-        memset(d_k, 0, sizeof(d_k));
-        memset(d_v, 0, sizeof(d_v));
+        memset(query_gradient_buffer, 0, sizeof(query_gradient_buffer));
+        memset(key_gradient_buffer, 0, sizeof(key_gradient_buffer));
+        memset(value_gradient_buffer, 0, sizeof(value_gradient_buffer));
 
-        // 4c. Attention Weights & Softmax Backward
-        for (int h = 0; h < N_HEADS; h++) {
-            int offset = h * D_HEAD;
-            for (int i = 0; i < seq_len; i++) {
-                float d_attn_w[Context_LEN];
-                memset(d_attn_w, 0, sizeof(d_attn_w));
-                for (int j = 0; j <= i; j++)
-                    for (int dh = 0; dh < D_HEAD; dh++) {
-                        d_attn_w[j] += d_attn_out_buf[i][offset + dh] * s_v[layer][h][j][dh];
-                        d_v[h][j][dh] += s_attn_w[layer][h][i][j] * d_attn_out_buf[i][offset + dh];
+        for (int head_index = 0; head_index < attention_head_count; head_index++) {
+            int head_offset = head_index * attention_head_dimension;
+            for (int query_position = 0; query_position < sequence_length; query_position++) {
+                float attention_weight_gradients[context_length_limit];
+                memset(attention_weight_gradients, 0, sizeof(attention_weight_gradients));
+                for (int key_position = 0; key_position <= query_position; key_position++)
+                    for (int head_dimension_index = 0; head_dimension_index < attention_head_dimension; head_dimension_index++) {
+                        attention_weight_gradients[key_position] += attention_output_gradient_buffer[query_position][head_offset + head_dimension_index] * saved_value_vectors[layer_index][head_index][key_position][head_dimension_index];
+                        value_gradient_buffer[head_index][key_position][head_dimension_index] += saved_attention_weights[layer_index][head_index][query_position][key_position] * attention_output_gradient_buffer[query_position][head_offset + head_dimension_index];
                     }
 
-                float dot = 0.0f;
-                for (int j = 0; j <= i; j++)
-                    dot += d_attn_w[j] * s_attn_w[layer][h][i][j];
+                float dot_product_accumulator = 0.0f;
+                for (int key_position = 0; key_position <= query_position; key_position++)
+                    dot_product_accumulator += attention_weight_gradients[key_position] * saved_attention_weights[layer_index][head_index][query_position][key_position];
 
-                // Backward pass through Softmax
-                float d_score[Context_LEN];
-                for (int j = 0; j <= i; j++)
-                    d_score[j] = s_attn_w[layer][h][i][j] * (d_attn_w[j] - dot);
+                float score_gradients[context_length_limit];
+                for (int key_position = 0; key_position <= query_position; key_position++)
+                    score_gradients[key_position] = saved_attention_weights[layer_index][head_index][query_position][key_position] * (attention_weight_gradients[key_position] - dot_product_accumulator);
 
-                // Gradients for Queries (Q) and Keys (K)
-                for (int j = 0; j <= i; j++)
-                    for (int dh = 0; dh < D_HEAD; dh++) {
-                        d_q[h][i][dh] += d_score[j] * scale * s_k[layer][h][j][dh];
-                        d_k[h][j][dh] += d_score[j] * scale * s_q[layer][h][i][dh];
+                for (int key_position = 0; key_position <= query_position; key_position++)
+                    for (int head_dimension_index = 0; head_dimension_index < attention_head_dimension; head_dimension_index++) {
+                        query_gradient_buffer[head_index][query_position][head_dimension_index] += score_gradients[key_position] * attention_scaling_factor * saved_key_vectors[layer_index][head_index][key_position][head_dimension_index];
+                        key_gradient_buffer[head_index][key_position][head_dimension_index] += score_gradients[key_position] * attention_scaling_factor * saved_query_vectors[layer_index][head_index][query_position][head_dimension_index];
                     }
             }
         }
 
-        // 4d. Linear Projections (W_Q, W_K, W_V) Backward
-        memset(d_normed_buf, 0, sizeof(d_normed_buf));
-        for (int h = 0; h < N_HEADS; h++)
-            for (int pos = 0; pos < seq_len; pos++)
-                for (int dh = 0; dh < D_HEAD; dh++)
-                    for (int d = 0; d < D_MODEL; d++) {
-                        d_normed_buf[pos][d] += d_q[h][pos][dh] * W_Q[layer][h][dh][d];
-                        d_normed_buf[pos][d] += d_k[h][pos][dh] * W_K[layer][h][dh][d];
-                        d_normed_buf[pos][d] += d_v[h][pos][dh] * W_V[layer][h][dh][d];
-                        g_W_Q[layer][h][dh][d] += d_q[h][pos][dh] * s_normed_attn[layer][pos][d];
-                        g_W_K[layer][h][dh][d] += d_k[h][pos][dh] * s_normed_attn[layer][pos][d];
-                        g_W_V[layer][h][dh][d] += d_v[h][pos][dh] * s_normed_attn[layer][pos][d];
+        memset(normalized_buffer, 0, sizeof(normalized_buffer));
+        for (int head_index = 0; head_index < attention_head_count; head_index++)
+            for (int position = 0; position < sequence_length; position++)
+                for (int head_dimension_index = 0; head_dimension_index < attention_head_dimension; head_dimension_index++)
+                    for (int dimension = 0; dimension < embedding_dimension_size; dimension++) {
+                        normalized_buffer[position][dimension] += query_gradient_buffer[head_index][position][head_dimension_index] * query_projection_weight_matrix[layer_index][head_index][head_dimension_index][dimension];
+                        normalized_buffer[position][dimension] += key_gradient_buffer[head_index][position][head_dimension_index] * key_projection_weight_matrix[layer_index][head_index][head_dimension_index][dimension];
+                        normalized_buffer[position][dimension] += value_gradient_buffer[head_index][position][head_dimension_index] * value_projection_weight_matrix[layer_index][head_index][head_dimension_index][dimension];
+                        query_projection_weight_gradient_matrix[layer_index][head_index][head_dimension_index][dimension] += query_gradient_buffer[head_index][position][head_dimension_index] * saved_attention_normalized_values[layer_index][position][dimension];
+                        key_projection_weight_gradient_matrix[layer_index][head_index][head_dimension_index][dimension] += key_gradient_buffer[head_index][position][head_dimension_index] * saved_attention_normalized_values[layer_index][position][dimension];
+                        value_projection_weight_gradient_matrix[layer_index][head_index][head_dimension_index][dimension] += value_gradient_buffer[head_index][position][head_dimension_index] * saved_attention_normalized_values[layer_index][position][dimension];
                     }
 
-        // 4e. Pre-Attention LayerNorm Backward
-        for (int pos = 0; pos < seq_len; pos++) {
-            float d_res_from_attn_ln[D_MODEL];
-            layer_norm_backward(d_normed_buf[pos], s_xhat_attn[layer][pos], s_inv_std_attn[layer][pos],
-                              ln_attn_scale[layer], d_res_from_attn_ln, g_ln_attn_scale[layer], g_ln_attn_bias[layer]);
-            for (int d = 0; d < D_MODEL; d++) d_residual[pos][d] += d_res_from_attn_ln[d];
+        for (int position = 0; position < sequence_length; position++) {
+            float residual_from_attention_normalization[embedding_dimension_size];
+            execute_layer_normalization_backward(normalized_buffer[position], saved_attention_normalized_hat[layer_index][position], saved_attention_inverse_standard_deviation[layer_index][position],
+                                              attention_layer_normalization_scale_parameters[layer_index], residual_from_attention_normalization, attention_layer_normalization_scale_gradient_parameters[layer_index], attention_layer_normalization_bias_parameters[layer_index]);
+            for (int dimension = 0; dimension < embedding_dimension_size; dimension++) residual_gradient_buffer[position][dimension] += residual_from_attention_normalization[dimension];
         }
     }
 
-    // STEP 5: EMBEDDINGS BACKWARD (Token & Positional Embeddings)
-    for (int pos = 0; pos < seq_len; pos++)
-        for (int d = 0; d < D_MODEL; d++)
+    for (int position = 0; position < sequence_length; position++)
+        for (int dimension = 0; dimension < embedding_dimension_size; dimension++)
         {
-            g_token_embedding[tokens[pos]][d] += d_residual[pos][d];
-            g_pos_embedding[pos][d] += d_residual[pos][d];
+            token_embedding_gradient_buffer[token_indices[position]][dimension] += residual_gradient_buffer[position][dimension];
+            positional_embedding_gradient_buffer[position][dimension] += residual_gradient_buffer[position][dimension];
         }
 }
 
-// Simple Stochastic Gradient Descent (SGD) step alternative.
-void sgd_step(float lr)
+// ============================================================================
+// TOKENIZATION & CORPUS PARSING
+// ============================================================================
+std::vector<int> convert_prompt_to_token_vector(const std::string& prompt_string, const std::map<std::string, int>& word_to_id_mapping)
 {
-    #define UPDATE(w, gw, size) \
-        for (int _i = 0; _i < (size); _i++) \
-            ((float*)(w))[_i] -= lr * ((float*)(gw))[_i];
-
-    UPDATE(token_embedding, g_token_embedding, VOCAB * D_MODEL);
-    UPDATE(pos_embedding, g_pos_embedding, Context_LEN * D_MODEL);
-    UPDATE(W_Q, g_W_Q, N_LAYERS * N_HEADS * D_HEAD * D_MODEL);
-    UPDATE(W_K, g_W_K, N_LAYERS * N_HEADS * D_HEAD * D_MODEL);
-    UPDATE(W_V, g_W_V, N_LAYERS * N_HEADS * D_HEAD * D_MODEL);
-    UPDATE(W_O, g_W_O, N_LAYERS * D_MODEL * D_MODEL);
-    UPDATE(W_mlp1, g_W_mlp1, N_LAYERS * D_MLP * D_MODEL);
-    UPDATE(W_mlp2, g_W_mlp2, N_LAYERS * D_MODEL * D_MLP);
-    UPDATE(ln_attn_scale, g_ln_attn_scale, N_LAYERS * D_MODEL);
-    UPDATE(ln_attn_bias,  g_ln_attn_bias,  N_LAYERS * D_MODEL);
-    UPDATE(ln_mlp_scale,  g_ln_mlp_scale,  N_LAYERS * D_MODEL);
-    UPDATE(ln_mlp_bias,   g_ln_mlp_bias,   N_LAYERS * D_MODEL);
-    UPDATE(ln_final_scale, g_ln_final_scale, D_MODEL);
-    UPDATE(ln_final_bias,  g_ln_final_bias,  D_MODEL);
-    UPDATE(W_unembed, g_W_unembed, VOCAB * D_MODEL);
-    #undef UPDATE
-}
-
-// ----------------------------------------------------------------------------
-// Tokenization & Parsing Helper
-// ----------------------------------------------------------------------------
-// Converts a raw text prompt into a vector of token IDs based on vocabulary map.
-std::vector<int> prompt_to_vector(const std::string& prompt_str, const std::map<std::string, int>& word_to_id)
-{
-    std::vector<int> prompt_ids;
-    std::stringstream ss(prompt_str);
+    std::vector<int> prompt_token_ids;
+    std::stringstream string_stream(prompt_string);
     std::string raw_word;
 
-    while (ss >> raw_word) {
+    while (string_stream >> raw_word) {
         std::string current_word = "";
-        for (char c : raw_word) {
-            if (ispunct(c) && c != '\'' && c != '-') {
+        for (char character : raw_word) {
+            if (ispunct(character) && character != '\'' && character != '-') {
                 if (!current_word.empty()) {
-                    if (word_to_id.find(current_word) != word_to_id.end()) {
-                        prompt_ids.push_back(word_to_id.at(current_word));
+                    if (word_to_id_mapping.find(current_word) != word_to_id_mapping.end()) {
+                        prompt_token_ids.push_back(word_to_id_mapping.at(current_word));
                     }
                     current_word = "";
                 }
-                std::string p(1, c);
-                if (word_to_id.find(p) != word_to_id.end()) {
-                    prompt_ids.push_back(word_to_id.at(p));
+                std::string punctuation_string(1, character);
+                if (word_to_id_mapping.find(punctuation_string) != word_to_id_mapping.end()) {
+                    prompt_token_ids.push_back(word_to_id_mapping.at(punctuation_string));
                 }
             } else {
-                current_word += tolower(c);
+                current_word += tolower(character);
             }
         }
         if (!current_word.empty()) {
-            if (word_to_id.find(current_word) != word_to_id.end()) {
-                prompt_ids.push_back(word_to_id.at(current_word));
+            if (word_to_id_mapping.find(current_word) != word_to_id_mapping.end()) {
+                prompt_token_ids.push_back(word_to_id_mapping.at(current_word));
             }
         }
     }
-    return prompt_ids;
+    return prompt_token_ids;
 }
 
-// Save trained model binary weights to disk.
-void saveModel(const std::string& filename)
+void save_model_weights_to_disk(const std::string& filename)
 {
-    std::ofstream file(filename, std::ios::binary);
-    if (!file.is_open()) {
+    std::ofstream file_stream(filename, std::ios::binary);
+    if (!file_stream.is_open()) {
         printf("Error: Could not open file '%s' for saving weights.\n", filename.c_str());
         return;
     }
 
-    file.write((char*)token_embedding, sizeof(token_embedding));
-    file.write((char*)pos_embedding, sizeof(pos_embedding));
-    file.write((char*)W_Q, sizeof(W_Q));
-    file.write((char*)W_K, sizeof(W_K));
-    file.write((char*)W_V, sizeof(W_V));
-    file.write((char*)W_O, sizeof(W_O));
-    file.write((char*)W_mlp1, sizeof(W_mlp1));
-    file.write((char*)W_mlp2, sizeof(W_mlp2));
-    file.write((char*)ln_attn_scale, sizeof(ln_attn_scale));
-    file.write((char*)ln_attn_bias,  sizeof(ln_attn_bias));
-    file.write((char*)ln_mlp_scale,  sizeof(ln_mlp_scale));
-    file.write((char*)ln_mlp_bias,   sizeof(ln_mlp_bias));
-    file.write((char*)ln_final_scale, sizeof(ln_final_scale));
-    file.write((char*)ln_final_bias,  sizeof(ln_final_bias));
-    file.write((char*)W_unembed, sizeof(W_unembed));
+    file_stream.write((char*)token_embedding_parameters, sizeof(token_embedding_parameters));
+    file_stream.write((char*)positional_embedding_parameters, sizeof(positional_embedding_parameters));
+    file_stream.write((char*)query_projection_weight_matrix, sizeof(query_projection_weight_matrix));
+    file_stream.write((char*)key_projection_weight_matrix, sizeof(key_projection_weight_matrix));
+    file_stream.write((char*)value_projection_weight_matrix, sizeof(value_projection_weight_matrix));
+    file_stream.write((char*)output_projection_weight_matrix, sizeof(output_projection_weight_matrix));
+    file_stream.write((char*)feed_forward_expansion_weight_matrix, sizeof(feed_forward_expansion_weight_matrix));
+    file_stream.write((char*)feed_forward_contraction_weight_matrix, sizeof(feed_forward_contraction_weight_matrix));
+    file_stream.write((char*)attention_layer_normalization_scale_parameters, sizeof(attention_layer_normalization_scale_parameters));
+    file_stream.write((char*)attention_layer_normalization_bias_parameters, sizeof(attention_layer_normalization_bias_parameters));
+    file_stream.write((char*)feed_forward_layer_normalization_scale_parameters, sizeof(feed_forward_layer_normalization_scale_parameters));
+    file_stream.write((char*)feed_forward_layer_normalization_bias_parameters, sizeof(feed_forward_layer_normalization_bias_parameters));
+    file_stream.write((char*)final_layer_normalization_scale_parameters, sizeof(final_layer_normalization_scale_parameters));
+    file_stream.write((char*)final_layer_normalization_bias_parameters, sizeof(final_layer_normalization_bias_parameters));
+    file_stream.write((char*)unembedding_projection_weight_matrix, sizeof(unembedding_projection_weight_matrix));
 
-    file.close();
+    file_stream.close();
     printf("Model successfully saved to binary file '%s'.\n", filename.c_str());
 }
 
-// Load trained model binary weights from disk.
-void loadModel(const std::string& filename)
+void load_model_weights_from_disk(const std::string& filename)
 {
-    std::ifstream file(filename, std::ios::binary);
-    if (!file.is_open()) {
+    std::ifstream file_stream(filename, std::ios::binary);
+    if (!file_stream.is_open()) {
         printf("Error: Could not open file '%s' for loading weights.\n", filename.c_str());
         return;
     }
 
-    file.read((char*)token_embedding, sizeof(token_embedding));
-    file.read((char*)pos_embedding, sizeof(pos_embedding));
-    file.read((char*)W_Q, sizeof(W_Q));
-    file.read((char*)W_K, sizeof(W_K));
-    file.read((char*)W_V, sizeof(W_V));
-    file.read((char*)W_O, sizeof(W_O));
-    file.read((char*)W_mlp1, sizeof(W_mlp1));
-    file.read((char*)W_mlp2, sizeof(W_mlp2));
-    file.read((char*)ln_attn_scale, sizeof(ln_attn_scale));
-    file.read((char*)ln_attn_bias,  sizeof(ln_attn_bias));
-    file.read((char*)ln_mlp_scale,  sizeof(ln_mlp_scale));
-    file.read((char*)ln_mlp_bias,   sizeof(ln_mlp_bias));
-    file.read((char*)ln_final_scale, sizeof(ln_final_scale));
-    file.read((char*)ln_final_bias,  sizeof(ln_final_bias));
-    file.read((char*)W_unembed, sizeof(W_unembed));
+    file_stream.read((char*)token_embedding_parameters, sizeof(token_embedding_parameters));
+    file_stream.read((char*)positional_embedding_parameters, sizeof(positional_embedding_parameters));
+    file_stream.read((char*)query_projection_weight_matrix, sizeof(query_projection_weight_matrix));
+    file_stream.read((char*)key_projection_weight_matrix, sizeof(key_projection_weight_matrix));
+    file_stream.read((char*)value_projection_weight_matrix, sizeof(value_projection_weight_matrix));
+    file_stream.read((char*)output_projection_weight_matrix, sizeof(output_projection_weight_matrix));
+    file_stream.read((char*)feed_forward_expansion_weight_matrix, sizeof(feed_forward_expansion_weight_matrix));
+    file_stream.read((char*)feed_forward_contraction_weight_matrix, sizeof(feed_forward_contraction_weight_matrix));
+    file_stream.read((char*)attention_layer_normalization_scale_parameters, sizeof(attention_layer_normalization_scale_parameters));
+    file_stream.read((char*)attention_layer_normalization_bias_parameters, sizeof(attention_layer_normalization_bias_parameters));
+    file_stream.read((char*)feed_forward_layer_normalization_scale_parameters, sizeof(feed_forward_layer_normalization_scale_parameters));
+    file_stream.read((char*)feed_forward_layer_normalization_bias_parameters, sizeof(feed_forward_layer_normalization_bias_parameters));
+    file_stream.read((char*)final_layer_normalization_scale_parameters, sizeof(final_layer_normalization_scale_parameters));
+    file_stream.read((char*)final_layer_normalization_bias_parameters, sizeof(final_layer_normalization_bias_parameters));
+    file_stream.read((char*)unembedding_projection_weight_matrix, sizeof(unembedding_projection_weight_matrix));
 
-    file.close();
+    file_stream.close();
     printf("Model successfully loaded from binary file '%s'.\n", filename.c_str());
 }
 
 // ============================================================================
-// INFERENCE & AUTOREGRESSIVE SAMPLING
+// INFERENCE & GENERATION
 // ============================================================================
-// Generates text autoregressively (token by token) given a prompt.
-// Incorporates 3 sampling techniques:
-// 1. Repetition Penalty: Reduces probability of recently generated tokens.
-// 2. Temperature Scaling: Controls randomness (lower = deterministic, higher = creative).
-// 3. Top-K Sampling: Restricts sampling to the top-K most likely candidates.
-void generate_words(const int* prompt_ids, int prompt_len, int max_new_tokens)
+void generate_autoregressive_tokens(const int* prompt_token_ids, int prompt_length, int max_new_tokens)
 {
-    std::vector<int> current_tokens;
-    for (int i = 0; i < prompt_len && i < Context_LEN; i++) {
-        current_tokens.push_back(prompt_ids[i]);
+    std::vector<int> current_generation_tokens;
+    for (int index = 0; index < prompt_length && index < context_length_limit; index++) {
+        current_generation_tokens.push_back(prompt_token_ids[index]);
     }
 
     printf("\n--- Generating Words ---\nPrompt: ");
-    for (int id : current_tokens) {
-        printf("%s ", VOCAB_WORDS[id]);
+    for (int token_id : current_generation_tokens) {
+        printf("%s ", vocabulary_word_strings[token_id]);
     }
     printf("\nOutput: ");
-    for (int id : current_tokens) {
-        printf("%s ", VOCAB_WORDS[id]);
+    for (int token_id : current_generation_tokens) {
+        printf("%s ", vocabulary_word_strings[token_id]);
     }
 
-    // Sampling parameters
-    const float temperature = 0.7f; // Lower = more focused, Higher = more creative
-    const int top_k = 20;           // Only sample from the top 20 most likely words
-    const float penalty = 1.2f;     // Mild additive penalty
+    const float generation_temperature = 0.7f;
+    const int top_k_sampling_limit = 20;
+    const float repetition_penalty_value = 1.2f;
 
-    for (int t = 0; t < max_new_tokens; t++) {
-        int seq_len = (int)current_tokens.size();
-        if (seq_len > Context_LEN) break;
+    for (int step = 0; step < max_new_tokens; step++) {
+        int current_sequence_length = (int)current_generation_tokens.size();
+        if (current_sequence_length > context_length_limit) break;
 
-        forward_pass(current_tokens.data(), current_tokens.data(), seq_len);
-        int last_pos = seq_len - 1;
+        execute_forward_pass(current_generation_tokens.data(), current_generation_tokens.data(), current_sequence_length);
+        int last_position_index = current_sequence_length - 1;
 
-        // 1. Gentle Additive Repetition Penalty (Last 15 tokens only)
-        int lookback = std::max(0, seq_len - 15);
-        for (int i = lookback; i < seq_len; i++) {
-            int recent_word = current_tokens[i];
-            if (recent_word > 0 && recent_word < VOCAB) {
-                logits[last_pos][recent_word] -= penalty;
+        int lookback_window_start = std::max(0, current_sequence_length - 15);
+        for (int index = lookback_window_start; index < current_sequence_length; index++) {
+            int recent_token_id = current_generation_tokens[index];
+            if (recent_token_id > 0 && recent_token_id < current_vocabulary_size) {
+                vocabulary_logits_buffer[last_position_index][recent_token_id] -= repetition_penalty_value;
             }
         }
 
-        // 2. Temperature Scaling
-        for (int v = 0; v < VOCAB; v++) {
-            logits[last_pos][v] /= temperature;
+        for (int vocabulary_index = 0; vocabulary_index < current_vocabulary_size; vocabulary_index++) {
+            vocabulary_logits_buffer[last_position_index][vocabulary_index] /= generation_temperature;
         }
 
-        // 3. Find Max Logit for Softmax Numerical Stability
-        float max_logit = logits[last_pos][0];
-        for (int v = 1; v < VOCAB; v++) {
-            if (logits[last_pos][v] > max_logit) max_logit = logits[last_pos][v];
+        float maximum_logit_value = vocabulary_logits_buffer[last_position_index][0];
+        for (int vocabulary_index = 1; vocabulary_index < current_vocabulary_size; vocabulary_index++) {
+            if (vocabulary_logits_buffer[last_position_index][vocabulary_index] > maximum_logit_value) maximum_logit_value = vocabulary_logits_buffer[last_position_index][vocabulary_index];
         }
 
-        // 4. Compute Softmax Probabilities & Gather Top-K
-        std::vector<std::pair<float, int>> probs(VOCAB);
-        float sum_exp = 0.0f;
-        for (int v = 0; v < VOCAB; v++) {
-            float exp_val = expf(logits[last_pos][v] - max_logit);
-            probs[v] = {exp_val, v};
-            sum_exp += exp_val;
+        std::vector<std::pair<float, int>> probability_pairs(current_vocabulary_size);
+        float exponential_sum = 0.0f;
+        for (int vocabulary_index = 0; vocabulary_index < current_vocabulary_size; vocabulary_index++) {
+            float exponential_value = expf(vocabulary_logits_buffer[last_position_index][vocabulary_index] - maximum_logit_value);
+            probability_pairs[vocabulary_index] = {exponential_value, vocabulary_index};
+            exponential_sum += exponential_value;
         }
 
-        // Sort logits descending
-        std::sort(probs.rbegin(), probs.rend());
+        std::sort(probability_pairs.rbegin(), probability_pairs.rend());
 
-        // 5. Sample from Top-K Candidates
-        int actual_k = std::min(top_k, VOCAB);
-        float top_k_sum = 0.0f;
-        for (int i = 0; i < actual_k; i++) {
-            top_k_sum += probs[i].first;
+        int actual_top_k = std::min(top_k_sampling_limit, current_vocabulary_size);
+        float top_k_cumulative_sum = 0.0f;
+        for (int index = 0; index < actual_top_k; index++) {
+            top_k_cumulative_sum += probability_pairs[index].first;
         }
 
-        std::uniform_real_distribution<float> dist(0.0f, top_k_sum);
-        float r = dist(rng);
-        float accum = 0.0f;
-        int chosen_token = probs[0].second;
+        std::uniform_real_distribution<float> uniform_distribution(0.0f, top_k_cumulative_sum);
+        float random_sample_value = uniform_distribution(random_number_generator);
+        float cumulative_probability_accumulator = 0.0f;
+        int chosen_token_id = probability_pairs[0].second;
 
-        for (int i = 0; i < actual_k; i++) {
-            accum += probs[i].first;
-            if (r <= accum) {
-                chosen_token = probs[i].second;
+        for (int index = 0; index < actual_top_k; index++) {
+            cumulative_probability_accumulator += probability_pairs[index].first;
+            if (random_sample_value <= cumulative_probability_accumulator) {
+                chosen_token_id = probability_pairs[index].second;
                 break;
             }
         }
 
-        std::string token_str = VOCAB_WORDS[chosen_token];
-        if (token_str == "." || token_str == "," || token_str == "?" || token_str == "!" || token_str == ":" || token_str == ";")
+        std::string chosen_token_string = vocabulary_word_strings[chosen_token_id];
+        if (chosen_token_string == "." || chosen_token_string == "," || chosen_token_string == "?" || chosen_token_string == "!" || chosen_token_string == ":" || chosen_token_string == ";")
         {
-            printf("%s", token_str.c_str());
+            printf("%s", chosen_token_string.c_str());
         }
         else
         {
-            printf(" %s", token_str.c_str());
+            printf(" %s", chosen_token_string.c_str());
         }
 
-        current_tokens.push_back(chosen_token);
+        current_generation_tokens.push_back(chosen_token_id);
 
-        if (std::string(VOCAB_WORDS[chosen_token]) == "<|endoftext|>") {
+        if (chosen_token_string == "<|endoftext|>") {
             printf("\n[Reached end of text]\n");
             break;
         }
@@ -919,267 +775,232 @@ void generate_words(const int* prompt_ids, int prompt_len, int max_new_tokens)
     printf("\n------------------------\n");
 }
 
-// Generate vocabulary diagnostic report file.
-void save_token_report(
-    const std::string& model_file,
-    const std::vector<std::pair<std::string, int>>& sorted_vocab,
-    const std::map<std::string, int>& word_to_id)
+void save_token_frequency_report(
+    const std::string& model_file_name,
+    const std::vector<std::pair<std::string, int>>& sorted_vocabulary_list,
+    const std::map<std::string, int>& word_to_id_mapping)
 {
-    std::string report_file = model_file + std::string("_tokens.txt");
-
-    std::ofstream out(report_file);
-    if (!out.is_open()) {
-        printf("Failed to create token report '%s'\n", report_file.c_str());
+    std::string report_file_path = model_file_name + std::string("_tokens.txt");
+    std::ofstream output_file_stream(report_file_path);
+    if (!output_file_stream.is_open()) {
+        printf("Failed to create token report '%s'\n", report_file_path.c_str());
         return;
     }
 
-    out << "TOKEN_ID\tFREQUENCY\tWORD\n";
+    output_file_stream << "TOKEN_ID\tFREQUENCY\tWORD\n";
+    output_file_stream << "0\tN/A\t<unk>\n";
 
-    out << "0\tN/A\t<unk>\n";
-
-    for (const auto& p : sorted_vocab) {
-        auto it = word_to_id.find(p.first);
-        if (it == word_to_id.end())
+    for (const auto& pair_item : sorted_vocabulary_list) {
+        auto map_iterator = word_to_id_mapping.find(pair_item.first);
+        if (map_iterator == word_to_id_mapping.end())
             continue;
 
-        out << it->second
-            << '\t'
-            << p.second
-            << '\t'
-            << p.first
-            << '\n';
+        output_file_stream << map_iterator->second
+                           << '\t'
+                           << pair_item.second
+                           << '\t'
+                           << pair_item.first
+                           << '\n';
     }
 
-    out.close();
-    printf("Token report saved to '%s'\n", report_file.c_str());
+    output_file_stream.close();
+    printf("Token report saved to '%s'\n", report_file_path.c_str());
 }
 
-// ============================================================================
-// TOKENIZATION & CORPUS PARSING
-// ============================================================================
-// Simple word-level + punctuation tokenizer:
-// Reads raw text file, separates words and punctuation marks into vocabulary IDs,
-// and maps training corpus into sequence of integer token IDs.
-bool load_and_tokenize_corpus(const std::string& filename, std::vector<int>& training_word_ids, std::map<std::string, int>& word_to_id)
+bool load_and_tokenize_corpus_file(const std::string& filename, std::vector<int>& training_word_ids, std::map<std::string, int>& word_to_id_mapping)
 {
-    std::string corpus = "";
-    std::ifstream file(filename);
+    std::string raw_corpus_text = "";
+    std::ifstream file_stream(filename);
 
-    if (file.is_open()) {
-        std::string line;
-        while (std::getline(file, line)) {
-            corpus += line + " ";
+    if (file_stream.is_open()) {
+        std::string line_string;
+        while (std::getline(file_stream, line_string)) {
+            raw_corpus_text += line_string + " ";
         }
-        file.close();
+        file_stream.close();
         printf("Successfully loaded training corpus from '%s'.\n", filename.c_str());
     } else {
         printf("'%s' not found. Falling back to default story corpus.\n", filename.c_str());
-        corpus = "I walk down a wide road... <|endoftext|> Once upon a time...";
+        raw_corpus_text = "I walk down a wide road... <|endoftext|> Once upon a time...";
     }
 
-    std::vector<std::string> all_parsed_tokens;
-    std::map<std::string, int> token_counts;
-    std::string current_word = "";
+    std::vector<std::string> parsed_tokens_list;
+    std::map<std::string, int> token_frequency_map;
+    std::string current_word_buffer = "";
 
-    // Parse corpus character-by-character directly to avoid std::stringstream string-gluing bugs 
-    // and multi-byte UTF-8 fragmentation, leaving your raw file 100% untouched.
-    for (size_t i = 0; i < corpus.size(); ) {
-        unsigned char c = corpus[i];
+    for (size_t index = 0; index < raw_corpus_text.size(); ) {
+        unsigned char character = raw_corpus_text[index];
 
-        // Check for <|endoftext|> tag
-        if (corpus.compare(i, 13, "<|endoftext|>") == 0) {
-            if (!current_word.empty()) {
-                all_parsed_tokens.push_back(current_word);
-                token_counts[current_word]++;
-                current_word = "";
+        if (raw_corpus_text.compare(index, 13, "<|endoftext|>") == 0) {
+            if (!current_word_buffer.empty()) {
+                parsed_tokens_list.push_back(current_word_buffer);
+                token_frequency_map[current_word_buffer]++;
+                current_word_buffer = "";
             }
-            all_parsed_tokens.push_back("<|endoftext|>");
-            token_counts["<|endoftext|>"]++;
-            i += 13;
+            parsed_tokens_list.push_back("<|endoftext|>");
+            token_frequency_map["<|endoftext|>"]++;
+            index += 13;
             continue;
         }
 
-        // Whitespace acts as a token boundary
-        if (isspace(c)) {
-            if (!current_word.empty()) {
-                all_parsed_tokens.push_back(current_word);
-                token_counts[current_word]++;
-                current_word = "";
+        if (isspace(character)) {
+            if (!current_word_buffer.empty()) {
+                parsed_tokens_list.push_back(current_word_buffer);
+                token_frequency_map[current_word_buffer]++;
+                current_word_buffer = "";
             }
-            i++;
+            index++;
             continue;
         }
 
-        // Handle multi-byte UTF-8 smart quotes (“ ” ‘ ’) and normalize them cleanly to standard quotes
-        if (i + 2 < corpus.size() && 
-            (unsigned char)corpus[i] == 0xE2 && 
-            (unsigned char)corpus[i+1] == 0x80 && 
-            ((unsigned char)corpus[i+2] == 0x9C || (unsigned char)corpus[i+2] == 0x9D || 
-             (unsigned char)corpus[i+2] == 0x98 || (unsigned char)corpus[i+2] == 0x99)) {
+        if (index + 2 < raw_corpus_text.size() && 
+            (unsigned char)raw_corpus_text[index] == 0xE2 && 
+            (unsigned char)raw_corpus_text[index+1] == 0x80 && 
+            ((unsigned char)raw_corpus_text[index+2] == 0x9C || (unsigned char)raw_corpus_text[index+2] == 0x9D || 
+             (unsigned char)raw_corpus_text[index+2] == 0x98 || (unsigned char)raw_corpus_text[index+2] == 0x99)) {
             
-            if (!current_word.empty()) {
-                all_parsed_tokens.push_back(current_word);
-                token_counts[current_word]++;
-                current_word = "";
+            if (!current_word_buffer.empty()) {
+                parsed_tokens_list.push_back(current_word_buffer);
+                token_frequency_map[current_word_buffer]++;
+                current_word_buffer = "";
             }
 
-            std::string quote_char = "\"";
-            unsigned char q3 = corpus[i+2];
-            if (q3 == 0x98 || q3 == 0x99) quote_char = "'";
+            std::string quote_character_string = "\"";
+            unsigned char quote_type = raw_corpus_text[index+2];
+            if (quote_type == 0x98 || quote_type == 0x99) quote_character_string = "'";
 
-            all_parsed_tokens.push_back(quote_char);
-            token_counts[quote_char]++;
-            i += 3;
+            parsed_tokens_list.push_back(quote_character_string);
+            token_frequency_map[quote_character_string]++;
+            index += 3;
             continue;
         }
 
-        // Standard ASCII punctuation gets isolated as a standalone token
-        if (c < 128 && ispunct(c) && c != '\'' && c != '-') {
-            if (!current_word.empty()) {
-                all_parsed_tokens.push_back(current_word);
-                token_counts[current_word]++;
-                current_word = "";
+        if (character < 128 && ispunct(character) && character != '\'' && character != '-') {
+            if (!current_word_buffer.empty()) {
+                parsed_tokens_list.push_back(current_word_buffer);
+                token_frequency_map[current_word_buffer]++;
+                current_word_buffer = "";
             }
-            std::string punct_token(1, c);
-            all_parsed_tokens.push_back(punct_token);
-            token_counts[punct_token]++;
-            i++;
+            std::string punctuation_string(1, character);
+            parsed_tokens_list.push_back(punctuation_string);
+            token_frequency_map[punctuation_string]++;
+            index++;
             continue;
         }
 
-        // Accumulate regular words / characters safely
-        if (c >= 128) {
-            size_t char_len = 1;
-            if ((c & 0xE0) == 0xC0) char_len = 2;
-            else if ((c & 0xF0) == 0xE0) char_len = 3;
-            else if ((c & 0xF8) == 0xF0) char_len = 4;
+        if (character >= 128) {
+            size_t character_length = 1;
+            if ((character & 0xE0) == 0xC0) character_length = 2;
+            else if ((character & 0xF0) == 0xE0) character_length = 3;
+            else if ((character & 0xF8) == 0xF0) character_length = 4;
 
-            if (i + char_len <= corpus.size()) {
-                current_word += corpus.substr(i, char_len);
-                i += char_len;
+            if (index + character_length <= raw_corpus_text.size()) {
+                current_word_buffer += raw_corpus_text.substr(index, character_length);
+                index += character_length;
             } else {
-                current_word += c;
-                i++;
+                current_word_buffer += character;
+                index++;
             }
         } else {
-            current_word += tolower(c);
-            i++;
+            current_word_buffer += tolower(character);
+            index++;
         }
     }
 
-    if (!current_word.empty()) {
-        all_parsed_tokens.push_back(current_word);
-        token_counts[current_word]++;
+    if (!current_word_buffer.empty()) {
+        parsed_tokens_list.push_back(current_word_buffer);
+        token_frequency_map[current_word_buffer]++;
     }
 
-    // Sort vocabulary by frequency
-    std::vector<std::pair<std::string, int>> sorted_vocab(token_counts.begin(), token_counts.end());
-    std::sort(sorted_vocab.begin(), sorted_vocab.end(), [](const auto& a, const auto& b) {
-        return a.second > b.second;
+    std::vector<std::pair<std::string, int>> sorted_vocabulary_list(token_frequency_map.begin(), token_frequency_map.end());
+    std::sort(sorted_vocabulary_list.begin(), sorted_vocabulary_list.end(), [](const auto& pair_a, const auto& pair_b) {
+        return pair_a.second > pair_b.second;
     });
 
-    // Token 0: <unk>
-    word_to_id["<unk>"] = 0;
-    snprintf(VOCAB_WORDS[0], sizeof(VOCAB_WORDS[0]), "%s", "<unk>");
-    VOCAB = 1;
+    word_to_id_mapping["<unk>"] = 0;
+    snprintf(vocabulary_word_strings[0], sizeof(vocabulary_word_strings[0]), "%s", "<unk>");
+    current_vocabulary_size = 1;
 
-    // Token 1: <|endoftext|> (if present)
-    bool has_endoftext = false;
-    for (const auto& pair : sorted_vocab) {
-        if (pair.first == "<|endoftext|>") {
-            has_endoftext = true;
+    bool has_end_of_text_token = false;
+    for (const auto& pair_item : sorted_vocabulary_list) {
+        if (pair_item.first == "<|endoftext|>") {
+            has_end_of_text_token = true;
             break;
         }
     }
 
-    if (has_endoftext && VOCAB < MAX_VOCAB) {
-        word_to_id["<|endoftext|>"] = VOCAB;
-        snprintf(VOCAB_WORDS[VOCAB], sizeof(VOCAB_WORDS[VOCAB]), "%s", "<|endoftext|>");
-        VOCAB++;
+    if (has_end_of_text_token && current_vocabulary_size < maximum_vocabulary_size) {
+        word_to_id_mapping["<|endoftext|>"] = current_vocabulary_size;
+        snprintf(vocabulary_word_strings[current_vocabulary_size], sizeof(vocabulary_word_strings[current_vocabulary_size]), "%s", "<|endoftext|>");
+        current_vocabulary_size++;
     }
 
-    // Assign Token IDs to words and punctuation marks
-    for (const auto& pair : sorted_vocab) {
-        if (pair.first == "<|endoftext|>") continue;
+    for (const auto& pair_item : sorted_vocabulary_list) {
+        if (pair_item.first == "<|endoftext|>") continue;
 
-        if (VOCAB < MAX_VOCAB) {
-            word_to_id[pair.first] = VOCAB;
-            snprintf(VOCAB_WORDS[VOCAB], sizeof(VOCAB_WORDS[VOCAB]), "%s", pair.first.c_str());
-            VOCAB++;
+        if (current_vocabulary_size < maximum_vocabulary_size) {
+            word_to_id_mapping[pair_item.first] = current_vocabulary_size;
+            snprintf(vocabulary_word_strings[current_vocabulary_size], sizeof(vocabulary_word_strings[current_vocabulary_size]), "%s", pair_item.first.c_str());
+            current_vocabulary_size++;
         } else {
             break;
         }
     }
 
-    // Map parsed tokens to vocabulary IDs
-    for (const std::string& token : all_parsed_tokens) {
-        if (word_to_id.find(token) != word_to_id.end()) {
-            training_word_ids.push_back(word_to_id[token]);
+    for (const std::string& token_string : parsed_tokens_list) {
+        if (word_to_id_mapping.find(token_string) != word_to_id_mapping.end()) {
+            training_word_ids.push_back(word_to_id_mapping[token_string]);
         } else {
-            training_word_ids.push_back(0); // <unk>
+            training_word_ids.push_back(0);
         }
     }
 
-    printf("Frequency-based Tokenization Complete. Unique Vocabulary Size: %d words/symbols (Max allowed: %d).\n", VOCAB, MAX_VOCAB);
-    save_token_report(modelFile, sorted_vocab, word_to_id);
+    printf("Frequency-based Tokenization Complete. Unique Vocabulary Size: %d words/symbols.\n", current_vocabulary_size);
+    save_token_frequency_report(model_file_path, sorted_vocabulary_list, word_to_id_mapping);
     return true;
 }
 
-// Wrapper for text generation inference.
-void inference(const std::string& prompt, 
-               const std::map<std::string,int>& word_to_id)
+void execute_model_inference(const std::string& prompt_string, const std::map<std::string, int>& word_to_id_mapping)
 {
-    auto prompt_ids = prompt_to_vector(prompt, word_to_id);
-    generate_words(prompt_ids.data(), prompt_ids.size(), MAX_NEW_TOKENS);
+    auto prompt_token_ids = convert_prompt_to_token_vector(prompt_string, word_to_id_mapping);
+    generate_autoregressive_tokens(prompt_token_ids.data(), prompt_token_ids.size(), maximum_new_tokens_to_generate);
 }
 
 // ============================================================================
-// MODEL TRAINING LOOP
+// TRAINING LOOP
 // ============================================================================
-// Standard language model training loop:
-// 1. Randomly sample sequence windows from text token buffer.
-// 2. Perform forward pass (predict next token at each position).
-// 3. Compute loss & gradients via backward pass.
-// 4. Update model parameters with AdamW optimizer.
-void train(const std::vector<int>& training_word_ids)
+void execute_model_training(const std::vector<int>& training_word_ids)
 {
+    int batch_tokens[context_length_limit];
+    int batch_targets[context_length_limit];
     
-    int tokens[Context_LEN];
-    int targets[Context_LEN];
-    
-    for (int step = 0; step < N_STEPS; step++) {
-        clock_t start_time = clock();
-        zero_gradients();
+    for (int step = 0; step < total_training_steps; step++) {
+        clock_t training_start_time = clock();
+        reset_all_gradients();
 
-        // Sample random sequence segment of length Context_LEN
-        int start = rng() % (training_word_ids.size() - Context_LEN);
-        for (int i = 0; i < Context_LEN; i++) {
-            tokens[i]  = training_word_ids[start + i];
-            targets[i] = training_word_ids[start + i + 1]; // Target is next token (shifted by 1)
+        int random_start_offset = random_number_generator() % (training_word_ids.size() - context_length_limit);
+        for (int index = 0; index < context_length_limit; index++) {
+            batch_tokens[index]  = training_word_ids[random_start_offset + index];
+            batch_targets[index] = training_word_ids[random_start_offset + index + 1];
         }
 
-        float lr = get_lr(step, N_STEPS);
-        float loss = forward_pass(tokens, targets, Context_LEN);
-        backward_pass(tokens, targets, Context_LEN);
-        adamw_step(lr, step);     //sgd_step(lr);
+        float current_learning_rate = calculate_learning_rate_schedule(step, total_training_steps);
+        float computed_loss_value = execute_forward_pass(batch_tokens, batch_targets, context_length_limit);
+        execute_backward_pass(batch_tokens, batch_targets, context_length_limit);
+        execute_adamw_optimizer_step(current_learning_rate, step);
 
-        clock_t end_time = clock(); // End timer
-        float elapsed_ms = (float)(end_time - start_time) * 1000.0f / CLOCKS_PER_SEC;
+        clock_t training_end_time = clock();
+        float elapsed_milliseconds = (float)(training_end_time - training_start_time) * 1000.0f / CLOCKS_PER_SEC;
 
-        // Print every step and flush stdout immediately so it won't look frozen
-        printf("step %d loss %.4f [%.2f ms]\n", step, loss, elapsed_ms);
+        printf("step %d loss %.4f [%.2f ms]\n", step, computed_loss_value, elapsed_milliseconds);
 
-        if (step % 400 == 0)
-            printf("step %d loss %.4f\n", step, loss);
-        
-        if (loss <= EARLY_STOP_LOSS) {
-            printf("Early stopping triggered: Loss %.4f reached target threshold (<= %.1f)\n", loss, EARLY_STOP_LOSS);
+        if (computed_loss_value <= early_stopping_loss_threshold) {
+            printf("Early stopping triggered: Loss %.4f reached target threshold (<= %.1f)\n", computed_loss_value, early_stopping_loss_threshold);
             break;
         }
+    }
 
-     }
-
-    saveModel(modelFile);
+    save_model_weights_to_disk(model_file_path);
 }
 
 // ============================================================================
@@ -1187,24 +1008,25 @@ void train(const std::vector<int>& training_word_ids)
 // ============================================================================
 int main(int argc, char** argv)
 {
-    std::string trainingFile = (argc > 1) ? argv[1] : "TinyStories-valid.txt";
-    std::string prompt        = (argc > 2) ? argv[2] : "A Frog and a";
-    modelFile = trainingFile + ".bin";
+    std::string training_file_path = (argc > 1) ? argv[1] : "TinyStories-valid.txt";
+    std::string user_prompt_string = (argc > 2) ? argv[2] : "A Frog and a";
+    model_file_path = training_file_path + ".bin";
 
-    std::map<std::string,int> word_to_id;
+    std::map<std::string, int> word_to_id_mapping;
     std::vector<int> training_word_ids;
 
-    load_and_tokenize_corpus(trainingFile, training_word_ids, word_to_id);
-    initialize_weights();
+    load_and_tokenize_corpus_file(training_file_path, training_word_ids, word_to_id_mapping);
+    initialize_model_weights();
 
-    std::ifstream check_file(modelFile, std::ios::binary);
-    bool modelExists = check_file.is_open();
-    if (modelExists) {
-        check_file.close();
-        loadModel(modelFile);
+    std::ifstream check_file_stream(model_file_path, std::ios::binary);
+    bool model_file_exists = check_file_stream.is_open();
+    if (model_file_exists) {
+        check_file_stream.close();
+        load_model_weights_from_disk(model_file_path);
     } else {
-        train(training_word_ids);
+        execute_model_training(training_word_ids);
     }
 
-    inference(prompt, word_to_id);
+    execute_model_inference(user_prompt_string, word_to_id_mapping);
+    return 0;
 }
