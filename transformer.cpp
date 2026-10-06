@@ -1019,9 +1019,48 @@ void execute_model_training(const std::vector<int>& training_word_ids)
     save_model_weights_to_disk(model_file_path);
 }
 
-// ============================================================================
-// MAIN ENTRY POINT
-// ============================================================================
+bool load_vocabulary_from_tokens_file(
+    const std::string& model_file_name,
+    std::map<std::string, int>& word_to_id_mapping)
+{
+    std::string report_file_path = model_file_name + std::string("_tokens.txt");
+    std::ifstream input_file_stream(report_file_path);
+    if (!input_file_stream.is_open()) {
+        return false;
+    }
+
+    std::string header_line;
+    std::getline(input_file_stream, header_line); // Skip header: TOKEN_ID FREQUENCY WORD
+
+    word_to_id_mapping.clear();
+    current_vocabulary_size = 0;
+
+    int token_id;
+    std::string frequency_str, word_str;
+
+    while (input_file_stream >> token_id >> frequency_str) {
+        char tab_or_space;
+        input_file_stream.get(tab_or_space);
+        std::getline(input_file_stream, word_str);
+
+        if (!word_str.empty() && word_str.back() == '\r') {
+            word_str.pop_back();
+        }
+
+        if (token_id >= 0 && token_id < maximum_vocabulary_size) {
+            word_to_id_mapping[word_str] = token_id;
+            snprintf(vocabulary_word_strings[token_id], sizeof(vocabulary_word_strings[token_id]), "%s", word_str.c_str());
+            if (token_id >= current_vocabulary_size) {
+                current_vocabulary_size = token_id + 1;
+            }
+        }
+    }
+
+    input_file_stream.close();
+    printf("Loaded vocabulary of size %d from existing token file '%s'.\n", current_vocabulary_size, report_file_path.c_str());
+    return true;
+}
+
 int main(int argc, char** argv)
 {
     std::string training_file_path = (argc > 1) ? argv[1] : "TinyStories-valid.txt";
@@ -1031,15 +1070,26 @@ int main(int argc, char** argv)
     std::map<std::string, int> word_to_id_mapping;
     std::vector<int> training_word_ids;
 
-    load_and_tokenize_corpus_file(training_file_path, training_word_ids, word_to_id_mapping);
+    // 1. Try loading vocabulary from existing token report first
+    bool vocabulary_loaded = load_vocabulary_from_tokens_file(model_file_path, word_to_id_mapping);
+    if (!vocabulary_loaded) {
+        load_and_tokenize_corpus_file(training_file_path, training_word_ids, word_to_id_mapping);
+    }
+
     initialize_model_weights();
 
+    // 2. Check if model weights exist
     std::ifstream check_file_stream(model_file_path, std::ios::binary);
     bool model_file_exists = check_file_stream.is_open();
+
     if (model_file_exists) {
         check_file_stream.close();
         load_model_weights_from_disk(model_file_path);
     } else {
+        // If training is required but tokens weren't converted to IDs yet
+        if (training_word_ids.empty()) {
+            load_and_tokenize_corpus_file(training_file_path, training_word_ids, word_to_id_mapping);
+        }
         execute_model_training(training_word_ids);
     }
 
